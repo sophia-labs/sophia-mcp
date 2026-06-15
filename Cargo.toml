@@ -1,0 +1,59 @@
+[package]
+name = "neem"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Stdio MCP server that proxies Claude Code (and other MCP clients) to a Mnemosyne/garden backend. Tools are autopopulated from the backend, never hardcoded."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sophia-labs/neem-rs"
+default-run = "neem"
+
+[lib]
+name = "neem"
+path = "src/lib.rs"
+
+[[bin]]
+name = "neem"
+path = "src/main.rs"
+
+[features]
+default = []
+# LocalGarden via SUBPROCESS (spawn the prebuilt `gardend` binary). This is the
+# recommended local path and needs NO garden Cargo dependency — it only shells
+# out to a `gardend` on PATH / GARDEN_BIN. It is always compiled; the flag below
+# is only for the heavier in-process variant.
+#
+# `local-garden-lib`: EXPERIMENTAL in-process variant that links garden as a
+# Cargo crate and mints a Tauri MockRuntime AppHandle. Off by default because it
+# drags garden's full build (tauri-build/generate_context!, oxigraph, candle,
+# fastembed/onnxruntime, turso, yrs) into neem. See src/backend/local_lib.rs for
+# the integration seam and the exact blocker. Enabling it must NOT be required
+# for the core build.
+local-garden-lib = []
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "process", "time", "signal", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+wiremock = "0.6"
+
+# The in-process LocalGarden variant would add garden as a path dependency here,
+# behind the `local-garden-lib` feature, e.g.:
+#
+#   [target.'cfg(feature = "local-garden-lib")'.dependencies]
+#   garden_lib = { path = "../garden/src-tauri", package = "garden", default-features = false, features = ["headless"] }
+#
+# Cargo cannot make a *dependency* conditional on a feature via [target.cfg],
+# so in practice this requires an optional dep + `dep:`-activation. We keep it
+# OUT of the manifest entirely so the core build never attempts to resolve
+# garden. See src/backend/local_lib.rs for the full rationale + TODO.
