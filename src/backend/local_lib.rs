@@ -18,7 +18,7 @@
 //!
 //! `tauri::generate_context!()` is a build-time macro that needs garden's
 //! `tauri.conf.json` + build context and garden's `build.rs` (tauri-build).
-//! To use it from neem, neem would have to:
+//! To use it from sophia-mcp, sophia-mcp would have to:
 //!
 //!   1. Add garden as a path/git Cargo dependency with
 //!      `default-features = false, features = ["headless"]` (which activates
@@ -27,7 +27,7 @@
 //!   2. Inherit garden's ENTIRE build: `tauri-build` + `generate_context!`,
 //!      plus its heavy runtime deps — oxigraph, candle-core,
 //!      fastembed/onnxruntime (native ORT), turso, yrs, axum, reqwest. This is a
-//!      multi-minute, native-toolchain-heavy build that defeats neem's
+//!      multi-minute, native-toolchain-heavy build that defeats sophia-mcp's
 //!      "near-zero config, low-friction" goal.
 //!   3. Replicate gardend's main: leak a multi-thread tokio runtime, install it
 //!      via `tauri::async_runtime::set` BEFORE any async touches it, build the

@@ -1,19 +1,19 @@
 [package]
-name = "neem"
+name = "sophia-mcp"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Stdio MCP server that proxies Claude Code (and other MCP clients) to a Mnemosyne/garden backend. Tools are autopopulated from the backend, never hardcoded."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/sophia-labs/neem-rs"
-default-run = "neem"
+repository = "https://github.com/sophia-labs/sophia-mcp"
+default-run = "sophia-mcp"
 
 [lib]
-name = "neem"
+name = "sophia_mcp"
 path = "src/lib.rs"
 
 [[bin]]
-name = "neem"
+name = "sophia-mcp"
 path = "src/main.rs"
 
 [features]
@@ -26,7 +26,7 @@ default = []
 # `local-garden-lib`: EXPERIMENTAL in-process variant that links garden as a
 # Cargo crate and mints a Tauri MockRuntime AppHandle. Off by default because it
 # drags garden's full build (tauri-build/generate_context!, oxigraph, candle,
-# fastembed/onnxruntime, turso, yrs) into neem. See src/backend/local_lib.rs for
+# fastembed/onnxruntime, turso, yrs) into sophia-mcp. See src/backend/local_lib.rs for
 # the integration seam and the exact blocker. Enabling it must NOT be required
 # for the core build.
 local-garden-lib = []

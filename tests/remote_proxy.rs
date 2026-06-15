@@ -3,7 +3,7 @@
 //! `tools/list` passthrough, `tools/call` passthrough, auth header injection,
 //! and JSON-RPC error surfacing.
 
-use neem::backend::{AuthHeaders, Backend, RemoteHttp};
+use sophia_mcp::backend::{AuthHeaders, Backend, RemoteHttp};
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

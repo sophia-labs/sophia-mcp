@@ -70,7 +70,7 @@ async fn handle_request(backend: &dyn Backend, req: JsonRpcRequest) -> Option<Js
             return Some(JsonRpcResponse::error(
                 id,
                 mcp::METHOD_NOT_FOUND,
-                format!("method not supported by neem proxy: {other}"),
+                format!("method not supported by sophia-mcp proxy: {other}"),
             ));
         }
     };
@@ -101,7 +101,7 @@ fn reconcile_initialize(mut backend_result: Value) -> Value {
     obj.entry("capabilities")
         .or_insert_with(|| json!({ "tools": {} }));
     obj.entry("serverInfo").or_insert_with(|| {
-        json!({ "name": "neem", "version": env!("CARGO_PKG_VERSION") })
+        json!({ "name": "sophia-mcp", "version": env!("CARGO_PKG_VERSION") })
     });
     backend_result
 }

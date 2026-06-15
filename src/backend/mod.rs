@@ -8,7 +8,7 @@
 //!   * [`LocalGarden`] — starts a headless `gardend` subprocess, then delegates
 //!     to a `RemoteHttp` pointed at its loopback `/mcp`. (`--backend local`)
 //!
-//! Both speak the identical MCP wire shape; the only difference is whether neem
+//! Both speak the identical MCP wire shape; the only difference is whether sophia-mcp
 //! *starts* the backend or merely *connects* to it.
 
 use async_trait::async_trait;
@@ -23,8 +23,8 @@ pub use local::LocalGarden;
 #[cfg(feature = "local-garden-lib")]
 pub mod local_lib;
 
-/// A proxy target. Methods mirror the three MCP methods neem forwards; tool
-/// payloads stay as opaque `Value`s — garden owns the schema, neem passes it
+/// A proxy target. Methods mirror the three MCP methods sophia-mcp forwards; tool
+/// payloads stay as opaque `Value`s — garden owns the schema, sophia-mcp passes it
 /// through.
 #[async_trait]
 pub trait Backend: Send + Sync {

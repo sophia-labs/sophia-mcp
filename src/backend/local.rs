@@ -11,7 +11,7 @@
 //! tauri-build apparatus + heavy deps (oxigraph, candle, fastembed/onnxruntime,
 //! turso, yrs) into a tool meant to be near-zero-friction. The whole rest of the
 //! system already treats gardend as a process/image (the platform-next gateway
-//! runs the `gardend` container and never links it). neem mirrors that. The
+//! runs the `gardend` container and never links it). sophia-mcp mirrors that. The
 //! in-process variant is scaffolded behind the `local-garden-lib` feature in
 //! `local_lib.rs` with the exact blocker.
 
@@ -28,7 +28,7 @@ use tokio::time::{sleep, Instant};
 
 use super::{AuthHeaders, Backend, RemoteHttp};
 
-/// Subset of gardend's `loopback.json` manifest neem needs (see garden
+/// Subset of gardend's `loopback.json` manifest sophia-mcp needs (see garden
 /// `src-tauri/src/loopback_state.rs`). Field names are camelCase on the wire.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,7 +67,7 @@ impl LocalGarden {
         let bin = resolve_gardend_bin(opts.garden_bin.as_deref())?;
         std::fs::create_dir_all(&opts.profile_dir).with_context(|| {
             format!(
-                "create neem profile dir {}",
+                "create sophia-mcp profile dir {}",
                 opts.profile_dir.display()
             )
         })?;
@@ -89,7 +89,7 @@ impl LocalGarden {
             .env("GARDEN_LOOPBACK_HOST", "127.0.0.1")
             .env("GARDEN_LOOPBACK_PORT", opts.port.to_string())
             .env("GARDEN_LOOPBACK_TOKEN", &token)
-            // gardend logs to stderr; let it flow to neem's stderr (stdout is the
+            // gardend logs to stderr; let it flow to sophia-mcp's stderr (stdout is the
             // MCP channel and must stay clean).
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
@@ -166,7 +166,7 @@ fn resolve_gardend_bin(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
     }
 
     let mut candidates: Vec<PathBuf> = Vec::new();
-    // Next to the neem binary.
+    // Next to the sophia-mcp binary.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("gardend"));

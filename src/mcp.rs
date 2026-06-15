@@ -3,9 +3,9 @@
 //! These mirror the wire contract that gardend's loopback `/mcp` route speaks
 //! (see garden `src-tauri/src/mcp_rpc_protocol.rs` and `loopback_mcp_routes.rs`)
 //! and that the platform-next gateway forwards verbatim at `/g/{id}/mcp`. We
-//! keep them deliberately thin: neem is a *proxy*, so most payloads (tool
+//! keep them deliberately thin: sophia-mcp is a *proxy*, so most payloads (tool
 //! catalogs, tool-call results) pass through as `serde_json::Value` and are
-//! never reshaped. Garden owns the tool registry; neem owns identity + routing.
+//! never reshaped. Garden owns the tool registry; sophia-mcp owns identity + routing.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,18 +71,18 @@ impl JsonRpcResponse {
     }
 }
 
-// Standard JSON-RPC / MCP error codes used by neem. The full set is kept for
-// completeness/reference even where neem doesn't currently emit each one.
+// Standard JSON-RPC / MCP error codes used by sophia-mcp. The full set is kept for
+// completeness/reference even where sophia-mcp doesn't currently emit each one.
 pub const PARSE_ERROR: i64 = -32700;
 #[allow(dead_code)]
 pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 #[allow(dead_code)]
 pub const INTERNAL_ERROR: i64 = -32603;
-/// neem-originated upstream/transport failure (backend unreachable, etc).
+/// sophia-mcp-originated upstream/transport failure (backend unreachable, etc).
 pub const BACKEND_ERROR: i64 = -32010;
 
-/// MCP method names neem understands at the stdio edge.
+/// MCP method names sophia-mcp understands at the stdio edge.
 pub mod method {
     pub const INITIALIZE: &str = "initialize";
     /// `notifications/initialized` — handled generically as a notification (no
@@ -94,6 +94,6 @@ pub mod method {
     pub const PING: &str = "ping";
 }
 
-/// The MCP protocol version neem advertises to the agent. Matches gardend
+/// The MCP protocol version sophia-mcp advertises to the agent. Matches gardend
 /// (`loopback_mcp_routes.rs` -> "2025-03-26").
 pub const PROTOCOL_VERSION: &str = "2025-03-26";

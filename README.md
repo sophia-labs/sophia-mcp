@@ -1,21 +1,21 @@
-# neem
+# sophia-mcp
 
 A tiny **stdio MCP server** that lets Claude Code (and any other MCP client) talk
 to a **Mnemosyne / garden** knowledge-graph backend.
 
-`neem` is a **proxy**. It does not implement tools. It forwards `initialize`,
+`sophia-mcp` is a **proxy**. It does not implement tools. It forwards `initialize`,
 `tools/list`, and `tools/call` to a backend, and the backend's tools are
 **autopopulated** — whatever the backend exposes is what the agent sees. Garden
-owns the tools; neem owns *who you are*, *which graph*, and *which backend*.
+owns the tools; sophia-mcp owns *who you are*, *which graph*, and *which backend*.
 
 There are two backends, sharing the exact same proxy core:
 
 | Backend | What it is | When |
 |---|---|---|
-| **LOCAL** (default) | neem **starts** a headless garden on your machine and proxies to its loopback. Near-zero config. | Out-of-the-box. Just run `neem`. |
-| **REMOTE `<url>`** | neem **connects** to an existing backend — a platform-next gateway cell `/g/{id}/mcp`, or any garden loopback `/mcp` — with auth. | You already have a hosted/shared graph. |
+| **LOCAL** (default) | sophia-mcp **starts** a headless garden on your machine and proxies to its loopback. Near-zero config. | Out-of-the-box. Just run `sophia-mcp`. |
+| **REMOTE `<url>`** | sophia-mcp **connects** to an existing backend — a platform-next gateway cell `/g/{id}/mcp`, or any garden loopback `/mcp` — with auth. | You already have a hosted/shared graph. |
 
-The only difference between them is whether neem *starts* the backend or just
+The only difference between them is whether sophia-mcp *starts* the backend or just
 *connects* to it.
 
 ---
@@ -24,7 +24,7 @@ The only difference between them is whether neem *starts* the backend or just
 
 ```bash
 cargo build --release
-# binary at ./target/release/neem
+# binary at ./target/release/sophia-mcp
 ```
 
 Requires a recent stable Rust (edition 2021, rustc ≥ 1.85).
@@ -34,28 +34,28 @@ Requires a recent stable Rust (edition 2021, rustc ≥ 1.85).
 ## Out-of-the-box (LOCAL backend)
 
 ```bash
-neem
+sophia-mcp
 ```
 
-That's it. With no arguments neem:
+That's it. With no arguments sophia-mcp:
 
 1. spawns a headless **`gardend`** on a local profile dir (default
-   `~/.neem/profile`, created on first run),
+   `~/.sophia-mcp/profile`, created on first run),
 2. waits for its `/health`,
 3. discovers the loopback endpoint + token from garden's `loopback.json`,
 4. proxies your agent's MCP traffic to `http://127.0.0.1:<port>/mcp`.
 
 Your agent immediately sees garden's full tool catalog (`search_documents`,
 `read_document`, `write_document`, `remember`, `list_graphs`, …) — **none of it
-hardcoded in neem**.
+hardcoded in sophia-mcp**.
 
 ### Prerequisite: the `gardend` binary
 
-The LOCAL backend runs the stock, OSS **garden** cell binary. neem finds it via,
+The LOCAL backend runs the stock, OSS **garden** cell binary. sophia-mcp finds it via,
 in order:
 
-1. `--garden-bin <path>` (or `NEEM_GARDEN_BIN`),
-2. a `gardend` next to the `neem` binary,
+1. `--garden-bin <path>` (or `SOPHIA_MCP_GARDEN_BIN`),
+2. a `gardend` next to the `sophia-mcp` binary,
 3. `../garden/src-tauri/target/release/gardend` (sibling checkout),
 4. `gardend` on `PATH`.
 
@@ -66,18 +66,18 @@ Build it once from the garden repo (it's a normal headless Cargo target):
 cargo build --release --no-default-features --features headless --bin gardend
 ```
 
-Then point neem at it if it isn't already discoverable:
+Then point sophia-mcp at it if it isn't already discoverable:
 
 ```bash
-neem --garden-bin /path/to/garden/src-tauri/target/release/gardend
+sophia-mcp --garden-bin /path/to/garden/src-tauri/target/release/gardend
 ```
 
 > **Why a subprocess, not a library link?** garden's in-process headless
 > entrypoint needs a Tauri MockRuntime `AppHandle` minted via `generate_context!`,
 > which would drag garden's entire native build (oxigraph, candle,
-> fastembed/onnxruntime, turso, yrs, tauri-build) into neem. The whole rest of
+> fastembed/onnxruntime, turso, yrs, tauri-build) into sophia-mcp. The whole rest of
 > the system already treats `gardend` as a process/image (the platform-next
-> gateway runs the `gardend` container and never links it). neem mirrors that.
+> gateway runs the `gardend` container and never links it). sophia-mcp mirrors that.
 > An experimental in-process variant is scaffolded behind the
 > `local-garden-lib` feature — see `src/backend/local_lib.rs` for the blocker.
 
@@ -87,14 +87,14 @@ neem --garden-bin /path/to/garden/src-tauri/target/release/gardend
 
 ```bash
 # A platform-next gateway, naming the graph:
-neem --backend https://gateway.example.com --graph my-graph \
+sophia-mcp --backend https://gateway.example.com --graph my-graph \
      --token "$PN_SERVICE_TOKEN" --on-behalf-of "$MY_COGNITO_SUB"
 
 # …or a full MCP endpoint directly:
-neem --backend https://gateway.example.com/g/my-graph/mcp --token "$JWT"
+sophia-mcp --backend https://gateway.example.com/g/my-graph/mcp --token "$JWT"
 
 # …or any garden loopback:
-neem --backend http://127.0.0.1:8086/mcp --token "$LOOPBACK_TOKEN"
+sophia-mcp --backend http://127.0.0.1:8086/mcp --token "$LOOPBACK_TOKEN"
 ```
 
 URL resolution:
@@ -102,17 +102,17 @@ URL resolution:
 * a URL ending in `/mcp` is used as-is;
 * a **base** URL plus `--graph <id>` becomes `<base>/g/<id>/mcp` (the gateway
   contract);
-* otherwise neem appends `/mcp`.
+* otherwise sophia-mcp appends `/mcp`.
 
 Auth header shapes (mirroring the choreograph reference proxy):
 
-| Mode | Headers neem sends |
+| Mode | Headers sophia-mcp sends |
 |---|---|
 | Gateway **service-auth** | `Authorization: Bearer <serviceToken>` + `x-pn-on-behalf-of: <sub>` |
 | Direct user (JWT) | `Authorization: Bearer <jwt>` (+ optional `X-User-ID` via `--user-id`) |
 | Garden loopback | `Authorization: Bearer <loopbackToken>` |
 
-When `--on-behalf-of` is set, neem does **not** also send `X-User-ID` — identity
+When `--on-behalf-of` is set, sophia-mcp does **not** also send `X-User-ID` — identity
 is the on-behalf-of header (the gateway runs its own per-graph ACL for that
 subject).
 
@@ -124,24 +124,24 @@ Every flag has an env var twin.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--backend` | `NEEM_BACKEND` | `local` | `local`, or a backend URL |
-| `--token` | `NEEM_TOKEN` | — | bearer token for REMOTE |
-| `--on-behalf-of` | `NEEM_ON_BEHALF_OF` | — | gateway service-auth subject |
-| `--user-id` | `NEEM_USER_ID` | — | `X-User-ID` side-channel |
-| `--graph` | `NEEM_GRAPH` | — | graph id (builds `/g/{id}/mcp` for a base URL) |
-| `--profile-dir` | `NEEM_PROFILE_DIR` | `~/.neem/profile` | LOCAL data dir |
-| `--garden-bin` | `NEEM_GARDEN_BIN` | auto-discover | LOCAL `gardend` path |
-| `--local-port` | `NEEM_LOCAL_PORT` | `0` (OS-assigned) | LOCAL loopback port |
-| `--local-health-timeout` | `NEEM_LOCAL_HEALTH_TIMEOUT` | `30` | seconds to wait for `/health` |
+| `--backend` | `SOPHIA_MCP_BACKEND` | `local` | `local`, or a backend URL |
+| `--token` | `SOPHIA_MCP_TOKEN` | — | bearer token for REMOTE |
+| `--on-behalf-of` | `SOPHIA_MCP_ON_BEHALF_OF` | — | gateway service-auth subject |
+| `--user-id` | `SOPHIA_MCP_USER_ID` | — | `X-User-ID` side-channel |
+| `--graph` | `SOPHIA_MCP_GRAPH` | — | graph id (builds `/g/{id}/mcp` for a base URL) |
+| `--profile-dir` | `SOPHIA_MCP_PROFILE_DIR` | `~/.sophia-mcp/profile` | LOCAL data dir |
+| `--garden-bin` | `SOPHIA_MCP_GARDEN_BIN` | auto-discover | LOCAL `gardend` path |
+| `--local-port` | `SOPHIA_MCP_LOCAL_PORT` | `0` (OS-assigned) | LOCAL loopback port |
+| `--local-health-timeout` | `SOPHIA_MCP_LOCAL_HEALTH_TIMEOUT` | `30` | seconds to wait for `/health` |
 
-Logging goes to **stderr** (stdout is the MCP channel). Set `NEEM_LOG=debug` for
+Logging goes to **stderr** (stdout is the MCP channel). Set `SOPHIA_MCP_LOG=debug` for
 verbose output.
 
 ---
 
 ## Wire up Claude Code
 
-Claude Code launches MCP servers over stdio. Add neem to your `mcpServers`
+Claude Code launches MCP servers over stdio. Add sophia-mcp to your `mcpServers`
 config (`.mcp.json` at the project root, or your user-level Claude config):
 
 **LOCAL (out-of-the-box):**
@@ -150,10 +150,10 @@ config (`.mcp.json` at the project root, or your user-level Claude config):
 {
   "mcpServers": {
     "mnemosyne": {
-      "command": "/absolute/path/to/neem",
+      "command": "/absolute/path/to/sophia-mcp",
       "args": ["--backend", "local"],
       "env": {
-        "NEEM_GARDEN_BIN": "/absolute/path/to/gardend"
+        "SOPHIA_MCP_GARDEN_BIN": "/absolute/path/to/gardend"
       }
     }
   }
@@ -166,14 +166,14 @@ config (`.mcp.json` at the project root, or your user-level Claude config):
 {
   "mcpServers": {
     "mnemosyne": {
-      "command": "/absolute/path/to/neem",
+      "command": "/absolute/path/to/sophia-mcp",
       "args": [
         "--backend", "https://gateway.example.com",
         "--graph", "my-graph"
       ],
       "env": {
-        "NEEM_TOKEN": "your-service-or-jwt-token",
-        "NEEM_ON_BEHALF_OF": "your-cognito-sub"
+        "SOPHIA_MCP_TOKEN": "your-service-or-jwt-token",
+        "SOPHIA_MCP_ON_BEHALF_OF": "your-cognito-sub"
       }
     }
   }
@@ -183,7 +183,7 @@ config (`.mcp.json` at the project root, or your user-level Claude config):
 Or register it from the CLI:
 
 ```bash
-claude mcp add mnemosyne -- /absolute/path/to/neem --backend local
+claude mcp add mnemosyne -- /absolute/path/to/sophia-mcp --backend local
 ```
 
 Restart Claude Code; the Mnemosyne tools appear automatically.
@@ -193,7 +193,7 @@ Restart Claude Code; the Mnemosyne tools appear automatically.
 ## How it works
 
 ```
-Claude Code ──stdio JSON-RPC──▶ neem ──HTTP JSON-RPC──▶ backend /mcp
+Claude Code ──stdio JSON-RPC──▶ sophia-mcp ──HTTP JSON-RPC──▶ backend /mcp
             (initialize,                (same 3 methods,    (LOCAL gardend
              tools/list,                 verbatim           or REMOTE gateway
              tools/call)                 passthrough)        /g/{id}/mcp)
