@@ -10,6 +10,7 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, ORIGIN};
 use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 
 use crate::mcp::{method, JsonRpcRequest, JsonRpcResponse};
 
@@ -71,6 +72,7 @@ impl AuthHeaders {
 pub struct RemoteHttp {
     client: reqwest::Client,
     mcp_url: String,
+    gateway_base: Option<String>,
 }
 
 impl RemoteHttp {
@@ -84,7 +86,47 @@ impl RemoteHttp {
         Ok(Self {
             client,
             mcp_url: mcp_url.into(),
+            gateway_base: None,
         })
+    }
+
+    /// Bind a remote client to one explicit owner/local-id tuple. This first
+    /// asks the unscoped control plane for the authenticated identity's graph
+    /// cells, then activates only the exact selected generation. Merely naming
+    /// an unknown tuple can therefore never create it.
+    pub async fn connect_gateway(
+        raw_base: &str,
+        owner: &str,
+        graph: &str,
+        auth: AuthHeaders,
+    ) -> anyhow::Result<Self> {
+        if owner.trim().is_empty() || graph.trim().is_empty() {
+            return Err(anyhow!("owner and graph must be non-empty"));
+        }
+        let gateway_base = gateway_base(raw_base);
+        let headers = auth.into_header_map()?;
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .context("build reqwest client")?;
+        let mcp_url = format!(
+            "{gateway_base}/o/{}/g/{}/mcp",
+            urlencode_segment(owner),
+            urlencode_segment(graph)
+        );
+        let remote = Self {
+            client,
+            mcp_url,
+            gateway_base: Some(gateway_base.clone()),
+        };
+        remote.assert_discoverable(owner, graph).await?;
+        let activation_url = format!(
+            "{gateway_base}/o/{}/g/{}/activate",
+            urlencode_segment(owner),
+            urlencode_segment(graph)
+        );
+        remote.activate(&activation_url).await?;
+        Ok(remote)
     }
 
     /// Resolve a `--backend <url>` value into a concrete MCP endpoint.
@@ -114,7 +156,7 @@ impl RemoteHttp {
 
     /// POST a single JSON-RPC request and return its `result`, surfacing
     /// JSON-RPC errors as `anyhow::Error`.
-    async fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+    async fn rpc_at(&self, url: &str, method: &str, params: Value) -> anyhow::Result<Value> {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(json!(uuid::Uuid::new_v4().to_string())),
@@ -123,17 +165,17 @@ impl RemoteHttp {
         };
         let http = self
             .client
-            .post(&self.mcp_url)
+            .post(url)
             .json(&req)
             .send()
             .await
-            .with_context(|| format!("POST {} ({method})", self.mcp_url))?;
+            .with_context(|| format!("POST {url} ({method})"))?;
 
         let status = http.status();
         let body = http
             .text()
             .await
-            .with_context(|| format!("read response body from {}", self.mcp_url))?;
+            .with_context(|| format!("read response body from {url}"))?;
 
         if !status.is_success() {
             return Err(anyhow!(
@@ -154,6 +196,164 @@ impl RemoteHttp {
         }
         Ok(resp.result.unwrap_or(Value::Null))
     }
+
+    async fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        for _ in 0..2 {
+            let req = JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(uuid::Uuid::new_v4().to_string())),
+                method: method.to_string(),
+                params: params.clone(),
+            };
+            let http = self
+                .client
+                .post(&self.mcp_url)
+                .json(&req)
+                .send()
+                .await
+                .with_context(|| format!("POST {} ({method})", self.mcp_url))?;
+            if http.status() == reqwest::StatusCode::ACCEPTED {
+                let activation: Value = http
+                    .json()
+                    .await
+                    .context("parse progressive graph activation response")?;
+                let poll = activation
+                    .get("pollUrl")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("activation response omitted pollUrl"))?;
+                self.wait_activation(poll).await?;
+                continue;
+            }
+            let status = http.status();
+            let body = http
+                .text()
+                .await
+                .with_context(|| format!("read response body from {}", self.mcp_url))?;
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "backend returned HTTP {status} for {method}: {}",
+                    body.trim()
+                ));
+            }
+            let resp: JsonRpcResponse = serde_json::from_str(&body)
+                .with_context(|| format!("parse JSON-RPC response for {method}: {body}"))?;
+            if let Some(err) = resp.error {
+                return Err(anyhow!(
+                    "backend JSON-RPC error {} for {method}: {}",
+                    err.code,
+                    err.message
+                ));
+            }
+            return Ok(resp.result.unwrap_or(Value::Null));
+        }
+        Err(anyhow!("graph did not remain ready after activation"))
+    }
+
+    async fn assert_discoverable(&self, owner: &str, graph: &str) -> anyhow::Result<()> {
+        let base = self
+            .gateway_base
+            .as_deref()
+            .ok_or_else(|| anyhow!("gateway base is unavailable"))?;
+        let result = self
+            .rpc_at(
+                &format!("{base}/control/mcp"),
+                method::TOOLS_CALL,
+                json!({"name": "list_graphs", "arguments": {}}),
+            )
+            .await
+            .context("list accessible graph cells through /control/mcp")?;
+        let graphs = result
+            .get("structuredContent")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("control list_graphs returned no structuredContent array"))?;
+        let found = graphs.iter().any(|item| {
+            item.get("owner").and_then(Value::as_str) == Some(owner)
+                && item.get("graphId").and_then(Value::as_str) == Some(graph)
+        });
+        if !found {
+            return Err(anyhow!(
+                "selected graph ({owner}, {graph}) is not in this identity's list_graphs"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn activate(&self, activation_url: &str) -> anyhow::Result<()> {
+        let response = self
+            .client
+            .post(activation_url)
+            .send()
+            .await
+            .with_context(|| format!("POST {activation_url}"))?;
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .context("parse graph activation response")?;
+        if status.is_success() && status != reqwest::StatusCode::ACCEPTED {
+            return Ok(());
+        }
+        if status != reqwest::StatusCode::ACCEPTED {
+            return Err(anyhow!("graph activation returned HTTP {status}: {body}"));
+        }
+        let poll = body
+            .get("pollUrl")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("activation response omitted pollUrl"))?;
+        self.wait_activation(poll).await
+    }
+
+    async fn wait_activation(&self, poll_url: &str) -> anyhow::Result<()> {
+        let base = self
+            .gateway_base
+            .as_deref()
+            .ok_or_else(|| anyhow!("gateway base is unavailable"))?;
+        let url = if poll_url.starts_with("http://") || poll_url.starts_with("https://") {
+            poll_url.to_string()
+        } else {
+            format!("{base}/{}", poll_url.trim_start_matches('/'))
+        };
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let response = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("GET {url}"))?;
+            let status = response.status();
+            let body: Value = response
+                .json()
+                .await
+                .context("parse activation poll response")?;
+            if !status.is_success() {
+                return Err(anyhow!("activation poll returned HTTP {status}: {body}"));
+            }
+            match body.get("phase").and_then(Value::as_str) {
+                Some("ready") => return Ok(()),
+                Some("failed") => {
+                    return Err(anyhow!(
+                        "graph activation failed: {}",
+                        body.get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown error")
+                    ));
+                }
+                _ if Instant::now() >= deadline => {
+                    return Err(anyhow!("timed out waiting for graph tool readiness"));
+                }
+                _ => tokio::time::sleep(Duration::from_millis(250)).await,
+            }
+        }
+    }
+}
+
+fn gateway_base(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('/');
+    trimmed
+        .find("/o/")
+        .map(|index| trimmed[..index].to_string())
+        .unwrap_or_else(|| trimmed.to_string())
 }
 
 #[async_trait]

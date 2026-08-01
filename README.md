@@ -13,7 +13,7 @@ There are two backends, sharing the exact same proxy core:
 | Backend | What it is | When |
 |---|---|---|
 | **LOCAL** (default) | sophia-mcp **starts** a headless garden on your machine and proxies to its loopback. Near-zero config. | Out-of-the-box. Just run `sophia-mcp`. |
-| **REMOTE `<url>`** | sophia-mcp **connects** to an existing backend — a platform-next gateway cell `/g/{id}/mcp`, or any garden loopback `/mcp` — with auth. | You already have a hosted/shared graph. |
+| **REMOTE `<url>`** | sophia-mcp discovers and activates an authorized platform-next cell at `/o/{owner}/g/{id}/mcp`, or connects to an explicit Garden loopback `/mcp`. | You already have a hosted/shared graph. |
 
 The only difference between them is whether sophia-mcp *starts* the backend or just
 *connects* to it.
@@ -86,23 +86,22 @@ sophia-mcp --garden-bin /path/to/garden/src-tauri/target/release/gardend
 ## Point at an existing backend (REMOTE)
 
 ```bash
-# A platform-next gateway, naming the graph:
-sophia-mcp --backend https://gateway.example.com --graph my-graph \
+# A platform-next gateway, naming the canonical owner tuple:
+sophia-mcp --backend https://gateway.example.com \
+     --owner user:$MY_COGNITO_SUB --graph my-graph \
      --token "$PN_SERVICE_TOKEN" --on-behalf-of "$MY_COGNITO_SUB"
 
-# …or a full MCP endpoint directly:
-sophia-mcp --backend https://gateway.example.com/g/my-graph/mcp --token "$JWT"
-
-# …or any garden loopback:
+# …or an explicit Garden loopback:
 sophia-mcp --backend http://127.0.0.1:8086/mcp --token "$LOOPBACK_TOKEN"
 ```
 
 URL resolution:
 
-* a URL ending in `/mcp` is used as-is;
-* a **base** URL plus `--graph <id>` becomes `<base>/g/<id>/mcp` (the gateway
-  contract);
-* otherwise sophia-mcp appends `/mcp`.
+* a cloud-2 base URL plus `--owner <typed-id> --graph <id>` first checks the
+  tuple against `/control/mcp` `list_graphs`, waits for activation, and binds
+  `<base>/o/<owner>/g/<id>/mcp`;
+* an explicit non-gateway URL ending in `/mcp` is used as-is;
+* ambiguous remote URLs fail closed.
 
 Auth header shapes (mirroring the choreograph reference proxy):
 
@@ -128,7 +127,8 @@ Every flag has an env var twin.
 | `--token` | `SOPHIA_MCP_TOKEN` | — | bearer token for REMOTE |
 | `--on-behalf-of` | `SOPHIA_MCP_ON_BEHALF_OF` | — | gateway service-auth subject |
 | `--user-id` | `SOPHIA_MCP_USER_ID` | — | `X-User-ID` side-channel |
-| `--graph` | `SOPHIA_MCP_GRAPH` | — | graph id (builds `/g/{id}/mcp` for a base URL) |
+| `--owner` | `SOPHIA_MCP_OWNER` | — | stable typed owner required for cloud-2 |
+| `--graph` | `SOPHIA_MCP_GRAPH` | — | local graph id required for cloud-2 |
 | `--profile-dir` | `SOPHIA_MCP_PROFILE_DIR` | `~/.sophia-mcp/profile` | LOCAL data dir |
 | `--garden-bin` | `SOPHIA_MCP_GARDEN_BIN` | auto-discover | LOCAL `gardend` path |
 | `--local-port` | `SOPHIA_MCP_LOCAL_PORT` | `0` (OS-assigned) | LOCAL loopback port |
@@ -169,6 +169,7 @@ config (`.mcp.json` at the project root, or your user-level Claude config):
       "command": "/absolute/path/to/sophia-mcp",
       "args": [
         "--backend", "https://gateway.example.com",
+        "--owner", "user:your-cognito-sub",
         "--graph", "my-graph"
       ],
       "env": {
@@ -196,7 +197,7 @@ Restart Claude Code; the Mnemosyne tools appear automatically.
 Claude Code ──stdio JSON-RPC──▶ sophia-mcp ──HTTP JSON-RPC──▶ backend /mcp
             (initialize,                (same 3 methods,    (LOCAL gardend
              tools/list,                 verbatim           or REMOTE gateway
-             tools/call)                 passthrough)        /g/{id}/mcp)
+             tools/call)                 passthrough)        /o/{owner}/g/{id}/mcp)
 ```
 
 * **Transport in:** newline-delimited JSON-RPC 2.0 on stdin/stdout.

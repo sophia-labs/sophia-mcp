@@ -100,9 +100,8 @@ fn reconcile_initialize(mut backend_result: Value) -> Value {
         .or_insert_with(|| json!(mcp::PROTOCOL_VERSION));
     obj.entry("capabilities")
         .or_insert_with(|| json!({ "tools": {} }));
-    obj.entry("serverInfo").or_insert_with(|| {
-        json!({ "name": "sophia-mcp", "version": env!("CARGO_PKG_VERSION") })
-    });
+    obj.entry("serverInfo")
+        .or_insert_with(|| json!({ "name": "sophia-mcp", "version": env!("CARGO_PKG_VERSION") }));
     backend_result
 }
 
@@ -162,19 +161,18 @@ mod tests {
     #[tokio::test]
     async fn tools_call_forwards_params() {
         let params = json!({ "name": "remember", "arguments": { "x": 1 } });
-        let resp = handle_request(&Echo, req(Some(json!(3)), method::TOOLS_CALL, params.clone()))
-            .await
-            .unwrap();
+        let resp = handle_request(
+            &Echo,
+            req(Some(json!(3)), method::TOOLS_CALL, params.clone()),
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.result.unwrap()["structuredContent"], params);
     }
 
     #[tokio::test]
     async fn notifications_get_no_reply() {
-        let resp = handle_request(
-            &Echo,
-            req(None, method::INITIALIZED, json!({})),
-        )
-        .await;
+        let resp = handle_request(&Echo, req(None, method::INITIALIZED, json!({}))).await;
         assert!(resp.is_none());
     }
 

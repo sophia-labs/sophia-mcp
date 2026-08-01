@@ -51,9 +51,6 @@ async fn build_backend(cli: &Cli) -> anyhow::Result<Arc<dyn Backend>> {
     }
 
     // REMOTE backend: a URL to an existing backend's MCP endpoint.
-    let mcp_url = RemoteHttp::resolve_mcp_url(&cli.backend, cli.graph.as_deref());
-    tracing::info!(url = %mcp_url, "backend: REMOTE");
-
     let auth = AuthHeaders {
         bearer: cli.token.clone(),
         on_behalf_of: cli.on_behalf_of.clone(),
@@ -61,6 +58,24 @@ async fn build_backend(cli: &Cli) -> anyhow::Result<Arc<dyn Backend>> {
         // Remote endpoints (gateway / hosted) don't enforce a loopback Origin.
         origin: None,
     };
-    let remote = RemoteHttp::new(mcp_url, auth).context("building remote backend client")?;
-    Ok(Arc::new(remote))
+    if let (Some(owner), Some(graph)) = (cli.owner.as_deref(), cli.graph.as_deref()) {
+        let remote = RemoteHttp::connect_gateway(&cli.backend, owner, graph, auth)
+            .await
+            .context("discovering and activating owner-scoped remote graph")?;
+        tracing::info!(url = %remote.mcp_url(), owner, graph, "backend: REMOTE owner-scoped graph");
+        return Ok(Arc::new(remote));
+    }
+
+    // Preserve direct Garden loopback/sidecar interoperability. A cloud-2
+    // gateway base is never allowed through this compatibility branch: it
+    // must bind an explicit owner tuple and prove discovery first.
+    let direct = cli.backend.trim_end_matches('/');
+    if direct.ends_with("/mcp") && !direct.contains("/g/") {
+        let remote = RemoteHttp::new(direct, auth).context("connecting to direct Garden MCP")?;
+        tracing::info!(url = %remote.mcp_url(), "backend: REMOTE direct Garden MCP");
+        return Ok(Arc::new(remote));
+    }
+    Err(anyhow::anyhow!(
+        "remote cloud-2 gateways require both --owner user:<subject> and --graph; only an explicit direct /mcp endpoint may omit them"
+    ))
 }

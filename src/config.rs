@@ -2,7 +2,7 @@
 //!
 //! `sophia-mcp` with no args aims at a LOCAL headless garden (the out-of-the-box
 //! hero). `sophia-mcp --backend <url>` points at an existing backend (a platform-next
-//! gateway cell `/g/{id}/mcp`, or any garden loopback `/mcp`).
+//! gateway cell `/o/{owner}/g/{id}/mcp`, or any garden loopback `/mcp`).
 
 use std::path::PathBuf;
 
@@ -18,7 +18,7 @@ use clap::Parser;
 pub struct Cli {
     /// Backend selector. Either the literal `local` (start + proxy to a headless
     /// garden on this machine) or a URL to an existing backend's MCP endpoint
-    /// (e.g. `https://gw.example/g/my-graph/mcp` or
+    /// (e.g. `https://gw.example` with `--owner` + `--graph`, or
     /// `http://127.0.0.1:8086/mcp`). Defaults to `local`.
     #[arg(long, default_value = "local", env = "SOPHIA_MCP_BACKEND")]
     pub backend: String,
@@ -41,13 +41,19 @@ pub struct Cli {
     #[arg(long, env = "SOPHIA_MCP_USER_ID")]
     pub user_id: Option<String>,
 
-    /// Graph id. For a REMOTE backend given as a *base* URL (no `/g/.../mcp`
-    /// and no trailing `/mcp`), sophia-mcp will build `<base>/g/<graph>/mcp`. If the
-    /// URL already names a full MCP endpoint, this is informational only. For
+    /// Local graph id. A remote cloud-2 gateway requires this together with
+    /// `--owner`; sophia-mcp proves discovery via `/control/mcp`, activates the
+    /// tuple, and binds `<base>/o/<owner>/g/<graph>/mcp`. For
     /// LOCAL it selects the default graph the agent operates on (advisory;
     /// graph selection inside one local profile is via the graph tools).
     #[arg(long, env = "SOPHIA_MCP_GRAPH")]
     pub graph: Option<String>,
+
+    /// Stable typed graph owner (`user:<subject>`) for a remote cloud-2
+    /// gateway. Remote base URLs require both owner and graph so a local graph
+    /// name is never treated as globally unique.
+    #[arg(long, env = "SOPHIA_MCP_OWNER")]
+    pub owner: Option<String>,
 
     // ---- LOCAL backend knobs (ignored for remote) ----
     /// Profile/data directory for the local headless garden. Created on first

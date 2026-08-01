@@ -173,9 +173,7 @@ fn resolve_gardend_bin(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
         }
     }
     // Sibling garden checkout relative to cwd (dev convenience).
-    candidates.push(PathBuf::from(
-        "../garden/src-tauri/target/release/gardend",
-    ));
+    candidates.push(PathBuf::from("../garden/src-tauri/target/release/gardend"));
     candidates.push(PathBuf::from("../garden/src-tauri/target/debug/gardend"));
     // Bare name (let the OS resolve via PATH on spawn).
     for cand in &candidates {
@@ -187,10 +185,7 @@ fn resolve_gardend_bin(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from("gardend"))
 }
 
-async fn wait_for_manifest(
-    path: &Path,
-    timeout: Duration,
-) -> anyhow::Result<LoopbackManifest> {
+async fn wait_for_manifest(path: &Path, timeout: Duration) -> anyhow::Result<LoopbackManifest> {
     let deadline = Instant::now() + timeout;
     loop {
         if path.exists() {
