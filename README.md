@@ -13,7 +13,7 @@ There are two backends, sharing the exact same proxy core:
 | Backend | What it is | When |
 |---|---|---|
 | **LOCAL** (default) | sophia-mcp **starts** a headless garden on your machine and proxies to its loopback. Near-zero config. | Out-of-the-box. Just run `sophia-mcp`. |
-| **REMOTE `<url>`** | sophia-mcp discovers and activates an authorized platform-next cell at `/o/{owner}/g/{id}/mcp`, or connects to an explicit Garden loopback `/mcp`. | You already have a hosted/shared graph. |
+| **REMOTE `<url>`** | sophia-mcp discovers and activates an authorized platform-next cell at `/o/{owner}/g/{id}/mcp` — plus the gateway's control-plane tools and `graph_id` routing to your other graphs (see *Multi-graph*) — or connects to an explicit Garden loopback `/mcp`. | You already have a hosted/shared graph. |
 
 The only difference between them is whether sophia-mcp *starts* the backend or just
 *connects* to it.
@@ -115,6 +115,60 @@ When `--on-behalf-of` is set, sophia-mcp does **not** also send `X-User-ID` — 
 is the on-behalf-of header (the gateway runs its own per-graph ACL for that
 subject).
 
+### Multi-graph: control tools + `graph_id` routing
+
+Against a gateway, the agent sees **one** tool catalog that is the union of two
+upstreams:
+
+| Upstream | Endpoint | Tools |
+|---|---|---|
+| gateway control plane | `POST {base}/control/mcp` (probed first; `{base}/mcp` only with `--unified-mcp-fallback` when `/control/mcp` is 404) | `list_graphs`, `create_graph`, `manage_access`, `tombstone_graph`, `control_job_status`, … |
+| the bound graph's cell | `POST {base}/o/{owner}/g/{graph}/mcp` | garden's own tools (`search_documents`, `sparql_query`, `remember`, …) |
+
+`tools/list` merges both. If a control tool's name collides with a cell tool, the
+**control** one is exposed as `control_<name>` (the collision is logged to stderr);
+otherwise names are untouched. `tools/call` routes by name to the right upstream;
+an unknown name is a JSON-RPC `-32601` naming the tool.
+
+Every cell tool additionally accepts an optional **`graph_id`** (or `graphId`)
+argument. When it names a graph other than the bound one, sophia-mcp routes the
+call to `{base}/o/{owner}/g/{that_graph}/mcp` — same owner, one cached upstream
+session per graph. Routing is **by path**, so the gateway's ACL is the policy
+enforcement point:
+
+* the graph must appear in this identity's control-plane `list_graphs`
+  (refreshed once on a miss) — an unlisted name is refused *before* any request
+  touches its path, and sophia-mcp never creates or activates it;
+* a gateway `403`/`404` on a listed graph is surfaced verbatim (status + body).
+
+The argument stays in the call body, so the target cell receives its own id.
+(`graph_id` as a bare tool argument was once an unpoliced second carrier that
+made cells auto-create graphs; routing it through the gateway path closes that.)
+
+### Waiting for a routable cell
+
+A cloud-2 cell can be *boot-ready but not routable* (a running pod that does not
+yet answer MCP), and waking a dormant cell takes minutes. sophia-mcp therefore:
+
+1. on connect, proves the tuple via `list_graphs` and **kicks** activation
+   (`POST …/activate`) — then answers the stdio `initialize` immediately, as
+   `sophia-mcp`, without blocking on the cell;
+2. before the first cell call (and in the background right after connect), polls
+   `GET /activations/{id}` every `--activation-poll` seconds until the gateway's
+   terminal phase `ready` (`failed` is surfaced with its error), **then proves
+   routability with an MCP `initialize` on the cell path** — the only two
+   observations that count. A `200` from `/health`-style probes, or `activate`
+   answering `ready:true`, is never treated as readiness;
+3. on any mid-session `202 graph_activating` / `502` / `503` from the cell path,
+   drops the cached session, re-waits, and retries the call;
+4. bounds every wait by `--activation-timeout` (default 300 s). On expiry the
+   JSON-RPC error carries the elapsed seconds, the budget, the poll count and the
+   **last observed activation state** (e.g. `phase=hydrating — cell is hydrating
+   its registered generation`, or `cell path answered HTTP 503: …`) — never a
+   fabricated "not found".
+
+Progress is logged to stderr only (`SOPHIA_MCP_LOG=info`).
+
 ---
 
 ## CLI / config
@@ -128,7 +182,10 @@ Every flag has an env var twin.
 | `--on-behalf-of` | `SOPHIA_MCP_ON_BEHALF_OF` | — | gateway service-auth subject |
 | `--user-id` | `SOPHIA_MCP_USER_ID` | — | `X-User-ID` side-channel |
 | `--owner` | `SOPHIA_MCP_OWNER` | — | stable typed owner required for cloud-2 |
-| `--graph` | `SOPHIA_MCP_GRAPH` | — | local graph id required for cloud-2 |
+| `--graph` | `SOPHIA_MCP_GRAPH` | — | local graph id required for cloud-2 (the *bound* graph) |
+| `--activation-timeout` | `SOPHIA_MCP_ACTIVATION_TIMEOUT` | `300` | seconds to wait for a cell to become routable |
+| `--activation-poll` | `SOPHIA_MCP_ACTIVATION_POLL` | `2` | seconds between activation polls / cell retries |
+| `--unified-mcp-fallback` | `SOPHIA_MCP_UNIFIED_MCP_FALLBACK` | `false` | also try `{base}/mcp` for control tools when `/control/mcp` is 404 |
 | `--profile-dir` | `SOPHIA_MCP_PROFILE_DIR` | `~/.sophia-mcp/profile` | LOCAL data dir |
 | `--garden-bin` | `SOPHIA_MCP_GARDEN_BIN` | auto-discover | LOCAL `gardend` path |
 | `--local-port` | `SOPHIA_MCP_LOCAL_PORT` | `0` (OS-assigned) | LOCAL loopback port |
@@ -197,15 +254,17 @@ Restart Claude Code; the Mnemosyne tools appear automatically.
 Claude Code ──stdio JSON-RPC──▶ sophia-mcp ──HTTP JSON-RPC──▶ backend /mcp
             (initialize,                (same 3 methods,    (LOCAL gardend
              tools/list,                 verbatim           or REMOTE gateway
-             tools/call)                 passthrough)        /o/{owner}/g/{id}/mcp)
+             tools/call)                 passthrough)        /o/{owner}/g/{id}/mcp
+                                                             + /control/mcp)
 ```
 
 * **Transport in:** newline-delimited JSON-RPC 2.0 on stdin/stdout.
 * **Transport out:** "streamable-http-json" — a single JSON-RPC request POSTed
   to `/mcp`, a single JSON response. (Both gardend's loopback and the gateway
   speak this; the gateway forwards it byte-for-byte.)
-* **Tools:** never hardcoded. `tools/list` returns the backend's catalog;
-  `tools/call` forwards `{name, arguments}` and returns the result envelope.
+* **Tools:** never hardcoded. `tools/list` returns the backend's catalog (for a
+  gateway: cell ∪ control, see *Multi-graph*); `tools/call` forwards
+  `{name, arguments}` and returns the result envelope.
 
 ### Layout
 
@@ -216,12 +275,15 @@ src/
   mcp.rs               JSON-RPC 2.0 wire types + MCP method/error constants
   server.rs            stdio MCP loop (agent-facing): initialize/tools/list/tools/call
   backend/
-    mod.rs             the `Backend` trait
-    remote.rs          RemoteHttp — reqwest MCP client + auth headers (the proxy core)
+    mod.rs             the `Backend` trait + `ToolNotFound`
+    remote.rs          RemoteHttp — single-endpoint reqwest MCP client + auth headers
+    gateway.rs         GatewayBackend — control ∪ cell tools, graph_id routing,
+                       wait-for-routable across activation
     local.rs           LocalGarden — spawn gardend, wait /health, reuse RemoteHttp
     local_lib.rs       experimental in-process variant (feature `local-garden-lib`)
 tests/
   remote_proxy.rs      end-to-end RemoteHttp against a mock /mcp
+  gateway_multigraph.rs  end-to-end GatewayBackend against a mock gateway
 ```
 
 ---
@@ -232,9 +294,12 @@ tests/
 cargo test
 ```
 
-13 tests: URL resolution, auth-header construction, the stdio dispatch
-(initialize backfill, tools passthrough, notification handling, unknown
-method), and a wiremock-backed end-to-end of the remote proxy.
+37 tests: URL resolution, auth-header construction, catalog merging, the stdio
+dispatch (initialize backfill, tools passthrough, notification handling, unknown
+method / unknown tool), a wiremock-backed end-to-end of the direct remote proxy,
+and a wiremock gateway covering the union catalog, `graph_id` routing (listed,
+unlisted, 403, 404), activation waiting (flip-after-N, 503-forever, `failed`,
+repair-required, health-200-is-not-readiness) and mid-session re-activation.
 
 ---
 
