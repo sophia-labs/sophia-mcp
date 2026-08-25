@@ -185,9 +185,17 @@ yet answer MCP), and waking a dormant cell takes minutes. sophia-mcp therefore:
    `cell path answered HTTP 503: …`, or `request timed out after 12.0s: POST …`)
    — never a fabricated "not found";
 5. follows an activation `pollUrl` only on the gateway's own origin — an
-   off-origin URL is refused rather than sent the bearer token. A retryable
-   `5xx` at the connect-time kick is logged, not fatal (`graph_repair_required`
-   is typed non-retryable and surfaced at once).
+   off-origin URL is refused rather than sent the bearer token — and never
+   follows HTTP redirects (a `3xx` is surfaced as a gateway rejection naming
+   the `Location`; reqwest would keep `x-pn-on-behalf-of` across hosts and the
+   redirected body would otherwise be trusted as an activation record). A
+   retryable `5xx` at the connect-time kick is logged, not fatal
+   (`graph_repair_required` is typed non-retryable and surfaced at once).
+
+> **Follow-up, not fixed here:** the direct `--backend <url>/mcp` path
+> (`RemoteHttp::rpc`, also used by the LOCAL backend) has no per-request
+> ceiling yet — only the 10 s connect timeout and no-redirect policy from
+> `build_client` apply. `--request-timeout` bounds the gateway backend only.
 
 Progress is logged to stderr only (`SOPHIA_MCP_LOG=info`).
 

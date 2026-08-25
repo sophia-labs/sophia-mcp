@@ -820,7 +820,19 @@ impl GatewayBackend {
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = http.status();
-        let body = http.text().await.context("read activation poll body")?;
+        // Redirects are never followed (see `build_client`); name the target
+        // so the refusal is legible, then let the 3xx surface as a rejection.
+        let location = status.is_redirection().then(|| {
+            http.headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<no Location header>")
+                .to_string()
+        });
+        let mut body = http.text().await.context("read activation poll body")?;
+        if let Some(location) = location {
+            body = format!("redirect to '{location}' not followed; {}", body.trim());
+        }
         Ok(HttpReply { status, body })
     }
 

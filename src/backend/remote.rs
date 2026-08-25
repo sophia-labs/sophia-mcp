@@ -81,6 +81,10 @@ pub(crate) fn build_client(auth: AuthHeaders) -> anyhow::Result<reqwest::Client>
         .default_headers(headers)
         // A TCP/TLS connect that hangs is never a legitimate wait.
         .connect_timeout(std::time::Duration::from_secs(10))
+        // Never follow redirects: reqwest strips Authorization cross-host but
+        // not x-pn-on-behalf-of, and a redirected body must never be trusted
+        // as a gateway answer. A 3xx surfaces to the caller as-is.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build reqwest client")
 }

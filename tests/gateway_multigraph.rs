@@ -980,6 +980,108 @@ async fn an_off_origin_poll_url_is_refused_and_never_receives_credentials() {
     foreign.verify().await;
 }
 
+/// Mount: activate → 200 ready:true; cell path → 202 graph_activating whose
+/// pollUrl is `poll_url`. The wait then has to decide whether to follow it.
+async fn mount_cell_activating_with_poll_url(server: &MockServer, poll_url: String) {
+    Mock::given(method("POST"))
+        .and(path(activate_path("notes")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ready": true })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(cell_path("notes")))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            "code": "graph_activating", "activationId": "cell-1", "phase": "hydrating",
+            "pollUrl": poll_url
+        })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_poll_url_whose_host_merely_starts_with_the_base_is_refused() {
+    // F2: `{base}.evil.example/…` — a prefix check on the base string would
+    // pass this; origin equality must not.
+    let server = MockServer::start().await;
+    mount_control(&server, "/control/mcp", &["notes"]).await;
+    mount_cell_activating_with_poll_url(
+        &server,
+        format!("{}.evil.example/activations/cell-1", server.uri()),
+    )
+    .await;
+
+    let gw = connect(&server, "notes").await;
+    let msg = format!("{:#}", gw.warm().await.unwrap_err());
+    assert!(msg.contains("off-origin"), "got: {msg}");
+    assert!(msg.contains(".evil.example"), "got: {msg}");
+    assert_eq!(requests_to(&server, "/activations/").await, 0);
+}
+
+#[tokio::test]
+async fn a_poll_url_with_the_base_as_userinfo_before_a_foreign_host_is_refused() {
+    // F2: `{base}@{foreign}/…` parses as userinfo + a foreign host; a prefix
+    // check would send the bearer there.
+    let server = MockServer::start().await;
+    let foreign = MockServer::start().await;
+    mount_control(&server, "/control/mcp", &["notes"]).await;
+    let foreign_host = foreign.uri().trim_start_matches("http://").to_string();
+    mount_cell_activating_with_poll_url(
+        &server,
+        format!("{}@{foreign_host}/activations/cell-1", server.uri()),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/activations/cell-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "phase": "ready", "events": [] })))
+        .expect(0)
+        .mount(&foreign)
+        .await;
+
+    let gw = connect(&server, "notes").await;
+    let msg = format!("{:#}", gw.warm().await.unwrap_err());
+    assert!(msg.contains("off-origin"), "got: {msg}");
+    assert_eq!(foreign.received_requests().await.unwrap().len(), 0);
+    foreign.verify().await;
+}
+
+#[tokio::test]
+async fn an_on_origin_poll_url_that_redirects_off_origin_is_not_followed() {
+    // F1: a 302 from the gateway's own poll URL to a foreign host must not be
+    // followed (reqwest would keep x-pn-on-behalf-of) nor its body trusted.
+    let server = MockServer::start().await;
+    let foreign = MockServer::start().await;
+    mount_control(&server, "/control/mcp", &["notes"]).await;
+    Mock::given(method("POST"))
+        .and(path(activate_path("notes")))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            "ready": false, "activation": { "phase": "scheduling", "events": [] },
+            "pollUrl": "/activations/cell-1"
+        })))
+        .mount(&server)
+        .await;
+    let target = format!("{}/activations/cell-1", foreign.uri());
+    Mock::given(method("GET"))
+        .and(path("/activations/cell-1"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", target.as_str()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/activations/cell-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "phase": "ready", "events": [] })))
+        .expect(0)
+        .mount(&foreign)
+        .await;
+
+    let gw = connect(&server, "notes").await;
+    let msg = format!("{:#}", gw.warm().await.unwrap_err());
+    assert!(msg.contains("HTTP 302"), "got: {msg}");
+    assert!(msg.contains("redirect to") && msg.contains(&target), "got: {msg}");
+    assert!(msg.contains("not followed"), "got: {msg}");
+    assert_eq!(foreign.received_requests().await.unwrap().len(), 0);
+    assert_eq!(requests_to(&server, "/g/notes/mcp").await, 0, "a redirect must not count as ready");
+    foreign.verify().await;
+}
+
 #[tokio::test]
 async fn a_200_on_health_is_not_readiness_only_mcp_initialize_counts() {
     let server = MockServer::start().await;
