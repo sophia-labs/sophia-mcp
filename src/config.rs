@@ -55,6 +55,25 @@ pub struct Cli {
     #[arg(long, env = "SOPHIA_MCP_OWNER")]
     pub owner: Option<String>,
 
+    // ---- REMOTE gateway knobs (ignored for local / direct /mcp) ----
+    /// Seconds to wait for a graph cell to become ROUTABLE (activation
+    /// `phase: ready` AND a successful MCP `initialize` on the cell path)
+    /// before a request is answered with a truthful JSON-RPC error carrying the
+    /// last observed activation state. Waking a dormant cell takes minutes.
+    #[arg(long, default_value_t = 300, env = "SOPHIA_MCP_ACTIVATION_TIMEOUT")]
+    pub activation_timeout: u64,
+
+    /// Seconds between activation polls (`GET /activations/{id}`) and between
+    /// retries of a cell path that answered 202/502/503.
+    #[arg(long, default_value_t = 2, env = "SOPHIA_MCP_ACTIVATION_POLL")]
+    pub activation_poll: u64,
+
+    /// If the gateway answers HTTP 404 for `POST {base}/control/mcp`, also try
+    /// the unified `{base}/mcp` for the control-plane tools. Off by default:
+    /// today's gateway serves control tools only at `/control/mcp`.
+    #[arg(long, default_value_t = false, env = "SOPHIA_MCP_UNIFIED_MCP_FALLBACK")]
+    pub unified_mcp_fallback: bool,
+
     // ---- LOCAL backend knobs (ignored for remote) ----
     /// Profile/data directory for the local headless garden. Created on first
     /// run. Defaults to `~/.sophia-mcp/profile`.
