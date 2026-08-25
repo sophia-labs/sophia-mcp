@@ -125,25 +125,38 @@ upstreams:
 | gateway control plane | `POST {base}/control/mcp` (probed first; `{base}/mcp` only with `--unified-mcp-fallback` when `/control/mcp` is 404) | `list_graphs`, `create_graph`, `manage_access`, `tombstone_graph`, `control_job_status`, … |
 | the bound graph's cell | `POST {base}/o/{owner}/g/{graph}/mcp` | garden's own tools (`search_documents`, `sparql_query`, `remember`, …) |
 
-`tools/list` merges both. If a control tool's name collides with a cell tool, the
-**control** one is exposed as `control_<name>` (the collision is logged to stderr);
-otherwise names are untouched. `tools/call` routes by name to the right upstream;
+`tools/list` merges both. Control tools are **always** exposed as `control_<name>`
+(`control_list_graphs`, `control_create_graph`, …) so the agent-facing names stay
+stable across cell releases whatever a cell happens to call its own tools; cell
+tool names are untouched. When the cell paginates (`nextCursor`), control tools are
+appended only on the last page. `tools/call` routes by name to the right upstream;
 an unknown name is a JSON-RPC `-32601` naming the tool.
 
 Every cell tool additionally accepts an optional **`graph_id`** (or `graphId`)
 argument. When it names a graph other than the bound one, sophia-mcp routes the
-call to `{base}/o/{owner}/g/{that_graph}/mcp` — same owner, one cached upstream
-session per graph. Routing is **by path**, so the gateway's ACL is the policy
-enforcement point:
+call to `{base}/o/{listing-owner}/g/{that_graph}/mcp` — one cached upstream
+session per `(owner, graph)`. Routing is **by path**, so the gateway's ACL is the
+policy enforcement point:
 
 * the graph must appear in this identity's control-plane `list_graphs`
-  (refreshed once on a miss) — an unlisted name is refused *before* any request
+  (refreshed once on a miss; the listing is *replaced*, never unioned, so a
+  revoked graph stops routing) — an unlisted name is refused *before* any request
   touches its path, and sophia-mcp never creates or activates it;
+* the **owner comes from the listing**, never from an argument — a graph another
+  user shared with you routes to *their* `/o/…` path; a graph id listed under two
+  owners is refused naming both;
+* rows whose `lifecycleState` is not activatable (`tombstoned`, `purging`,
+  `purged`) are never activated — the refusal names the state;
 * a gateway `403`/`404` on a listed graph is surfaced verbatim (status + body).
 
-The argument stays in the call body, so the target cell receives its own id.
-(`graph_id` as a bare tool argument was once an unpoliced second carrier that
-made cells auto-create graphs; routing it through the gateway path closes that.)
+Naming a dormant graph wakes it: a node may be provisioned and the call may block
+for up to `--activation-timeout`.
+
+`graph_id` and `graphId` given together must agree, or the call is refused before
+any request; the body is rewritten so the target cell sees **exactly one** graph
+argument, equal to the routed path. (`graph_id` as a bare tool argument was once an
+unpoliced second carrier that made cells auto-create graphs; routing it through the
+gateway path and normalizing the body closes that.)
 
 ### Waiting for a routable cell
 
@@ -158,14 +171,23 @@ yet answer MCP), and waking a dormant cell takes minutes. sophia-mcp therefore:
    terminal phase `ready` (`failed` is surfaced with its error), **then proves
    routability with an MCP `initialize` on the cell path** — the only two
    observations that count. A `200` from `/health`-style probes, or `activate`
-   answering `ready:true`, is never treated as readiness;
+   answering `ready:true`, is never treated as readiness. A cell path that still
+   answers 202/502/503 is re-probed with backoff (`--activation-poll` × 2ⁿ, capped
+   at 8×); `activate` is POSTed at most once per wait;
 3. on any mid-session `202 graph_activating` / `502` / `503` from the cell path,
    drops the cached session, re-waits, and retries the call;
-4. bounds every wait by `--activation-timeout` (default 300 s). On expiry the
-   JSON-RPC error carries the elapsed seconds, the budget, the poll count and the
-   **last observed activation state** (e.g. `phase=hydrating — cell is hydrating
-   its registered generation`, or `cell path answered HTTP 503: …`) — never a
-   fabricated "not found".
+4. bounds every wait by `--activation-timeout` (default 300 s), *including* time
+   spent queued behind another waiter on the same graph, and bounds every single
+   HTTP request by the remaining budget and `--request-timeout` — a hung upstream
+   cannot stretch a wait. On expiry the JSON-RPC error carries the elapsed
+   seconds, the budget, the poll count and the **last observed activation state**
+   (e.g. `phase=hydrating — cell is hydrating its registered generation`, or
+   `cell path answered HTTP 503: …`, or `request timed out after 12.0s: POST …`)
+   — never a fabricated "not found";
+5. follows an activation `pollUrl` only on the gateway's own origin — an
+   off-origin URL is refused rather than sent the bearer token. A retryable
+   `5xx` at the connect-time kick is logged, not fatal (`graph_repair_required`
+   is typed non-retryable and surfaced at once).
 
 Progress is logged to stderr only (`SOPHIA_MCP_LOG=info`).
 
@@ -184,7 +206,8 @@ Every flag has an env var twin.
 | `--owner` | `SOPHIA_MCP_OWNER` | — | stable typed owner required for cloud-2 |
 | `--graph` | `SOPHIA_MCP_GRAPH` | — | local graph id required for cloud-2 (the *bound* graph) |
 | `--activation-timeout` | `SOPHIA_MCP_ACTIVATION_TIMEOUT` | `300` | seconds to wait for a cell to become routable |
-| `--activation-poll` | `SOPHIA_MCP_ACTIVATION_POLL` | `2` | seconds between activation polls / cell retries |
+| `--activation-poll` | `SOPHIA_MCP_ACTIVATION_POLL` | `2` | seconds between activation polls; base of the re-probe backoff |
+| `--request-timeout` | `SOPHIA_MCP_REQUEST_TIMEOUT` | `120` | per-request ceiling for any single HTTP request to the gateway |
 | `--unified-mcp-fallback` | `SOPHIA_MCP_UNIFIED_MCP_FALLBACK` | `false` | also try `{base}/mcp` for control tools when `/control/mcp` is 404 |
 | `--profile-dir` | `SOPHIA_MCP_PROFILE_DIR` | `~/.sophia-mcp/profile` | LOCAL data dir |
 | `--garden-bin` | `SOPHIA_MCP_GARDEN_BIN` | auto-discover | LOCAL `gardend` path |
@@ -294,12 +317,16 @@ tests/
 cargo test
 ```
 
-37 tests: URL resolution, auth-header construction, catalog merging, the stdio
-dispatch (initialize backfill, tools passthrough, notification handling, unknown
-method / unknown tool), a wiremock-backed end-to-end of the direct remote proxy,
-and a wiremock gateway covering the union catalog, `graph_id` routing (listed,
-unlisted, 403, 404), activation waiting (flip-after-N, 503-forever, `failed`,
-repair-required, health-200-is-not-readiness) and mid-session re-activation.
+51 tests: URL resolution, auth-header construction, catalog merging (prefixing,
+pagination), graph-argument parsing/normalization, the stdio dispatch (initialize
+backfill, tools passthrough, notification handling, unknown method / unknown tool),
+a wiremock-backed end-to-end of the direct remote proxy, and a wiremock gateway
+covering the union catalog, `graph_id` routing (listed, unlisted, revoked-on-refresh,
+tombstoned, shared-by-another-owner, ambiguous, disagreeing spellings, 403, 404),
+activation waiting (flip-after-N, 503-forever with backoff, hung upstream, queued
+waiter, `failed`, repair-required at connect and on the cell path, off-origin
+pollUrl, transient 503 at kick, health-200-is-not-readiness) and mid-session
+re-activation.
 
 ---
 
