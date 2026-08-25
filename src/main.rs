@@ -9,7 +9,9 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 
-use sophia_mcp::backend::{self, AuthHeaders, Backend, LocalGarden, RemoteHttp};
+use sophia_mcp::backend::{
+    self, AuthHeaders, Backend, GatewayBackend, GatewayOptions, LocalGarden, RemoteHttp,
+};
 use sophia_mcp::config::Cli;
 use sophia_mcp::server;
 
@@ -59,11 +61,33 @@ async fn build_backend(cli: &Cli) -> anyhow::Result<Arc<dyn Backend>> {
         origin: None,
     };
     if let (Some(owner), Some(graph)) = (cli.owner.as_deref(), cli.graph.as_deref()) {
-        let remote = RemoteHttp::connect_gateway(&cli.backend, owner, graph, auth)
-            .await
-            .context("discovering and activating owner-scoped remote graph")?;
-        tracing::info!(url = %remote.mcp_url(), owner, graph, "backend: REMOTE owner-scoped graph");
-        return Ok(Arc::new(remote));
+        let opts = GatewayOptions {
+            activation_timeout: Duration::from_secs(cli.activation_timeout),
+            activation_poll: Duration::from_secs(cli.activation_poll.max(1)),
+            unified_mcp_fallback: cli.unified_mcp_fallback,
+        };
+        let gateway = Arc::new(
+            GatewayBackend::connect(&cli.backend, owner, graph, auth, opts)
+                .await
+                .context("discovering owner-scoped remote graph through the gateway")?,
+        );
+        tracing::info!(
+            url = %gateway.mcp_url_for(graph),
+            control = %gateway.control_url(),
+            owner,
+            graph,
+            "backend: REMOTE gateway (control tools + bound graph, graph_id routing)"
+        );
+        // Wake the bound cell in the background so the stdio `initialize`
+        // handshake answers immediately; tools/list and tools/call do their own
+        // bounded wait and surface a truthful error if the cell stays cold.
+        let warm = Arc::clone(&gateway);
+        tokio::spawn(async move {
+            if let Err(e) = warm.warm().await {
+                tracing::warn!("bound graph not routable yet: {e:#}");
+            }
+        });
+        return Ok(gateway);
     }
 
     // Preserve direct Garden loopback/sidecar interoperability. A cloud-2

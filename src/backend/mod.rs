@@ -1,15 +1,18 @@
 //! The `Backend` trait — the seam every MCP backend implements, and which the
 //! stdio server proxies to.
 //!
-//! There are exactly two concrete backends:
-//!   * [`RemoteHttp`] — a reqwest MCP client to an existing backend URL with
-//!     auth headers. Used directly for `--backend <url>`, and reused internally
-//!     by the local backend once garden's loopback is up.
+//! There are three concrete backends:
+//!   * [`RemoteHttp`] — a reqwest MCP client to one existing endpoint with auth
+//!     headers. Used directly for an explicit `--backend <url>/mcp`, and reused
+//!     internally by the local backend once garden's loopback is up.
 //!   * [`LocalGarden`] — starts a headless `gardend` subprocess, then delegates
 //!     to a `RemoteHttp` pointed at its loopback `/mcp`. (`--backend local`)
+//!   * [`GatewayBackend`] — a platform-next gateway base URL + `--owner` +
+//!     `--graph`: the union of the gateway's control-plane tools and the bound
+//!     graph's cell tools, `graph_id` routing to sibling graphs, and
+//!     wait-for-routable across cell activation.
 //!
-//! Both speak the identical MCP wire shape; the only difference is whether sophia-mcp
-//! *starts* the backend or merely *connects* to it.
+//! All speak the identical MCP wire shape toward the agent.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -17,11 +20,21 @@ use serde_json::Value;
 mod remote;
 pub use remote::{AuthHeaders, RemoteHttp};
 
+pub mod gateway;
+pub use gateway::{GatewayBackend, GatewayOptions};
+
 pub mod local;
 pub use local::LocalGarden;
 
 #[cfg(feature = "local-garden-lib")]
 pub mod local_lib;
+
+/// `tools/call` named a tool no upstream serves. The stdio server maps this to
+/// a JSON-RPC `METHOD_NOT_FOUND` naming the tool (instead of a generic backend
+/// error), so an agent can tell "no such tool" from "the tool failed".
+#[derive(Debug, thiserror::Error)]
+#[error("unknown tool: {0}")]
+pub struct ToolNotFound(pub String);
 
 /// A proxy target. Methods mirror the three MCP methods sophia-mcp forwards; tool
 /// payloads stay as opaque `Value`s — garden owns the schema, sophia-mcp passes it
