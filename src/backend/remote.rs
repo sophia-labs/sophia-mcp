@@ -79,6 +79,8 @@ pub(crate) fn build_client(auth: AuthHeaders) -> anyhow::Result<reqwest::Client>
     let headers = auth.into_header_map()?;
     reqwest::Client::builder()
         .default_headers(headers)
+        // A TCP/TLS connect that hangs is never a legitimate wait.
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .context("build reqwest client")
 }

@@ -68,6 +68,13 @@ pub struct Cli {
     #[arg(long, default_value_t = 2, env = "SOPHIA_MCP_ACTIVATION_POLL")]
     pub activation_poll: u64,
 
+    /// Per-request ceiling (seconds) for any single HTTP request to the
+    /// gateway. Activation-wait requests are additionally bounded by the
+    /// remaining `--activation-timeout`, so a hung upstream can never stretch a
+    /// wait past its budget.
+    #[arg(long, default_value_t = 120, env = "SOPHIA_MCP_REQUEST_TIMEOUT")]
+    pub request_timeout: u64,
+
     /// If the gateway answers HTTP 404 for `POST {base}/control/mcp`, also try
     /// the unified `{base}/mcp` for the control-plane tools. Off by default:
     /// today's gateway serves control tools only at `/control/mcp`.

@@ -4,29 +4,35 @@
 //! One proxy, two upstreams, one merged tool surface:
 //!
 //!   * the gateway **control plane** at `POST {base}/control/mcp`
-//!     (`list_graphs`, `create_graph`, `manage_access`, `control_job_status`, …);
+//!     (`list_graphs`, `create_graph`, `manage_access`, `control_job_status`, …),
+//!     always exposed under the stable `control_` prefix;
 //!   * the **bound graph's cell** at `POST {base}/o/{owner}/g/{graph}/mcp`
 //!     (garden's own tools — `search_documents`, `sparql_query`, `remember`, …).
 //!
-//! `tools/list` is the union of both catalogs (a control tool is prefixed
-//! `control_` only when its name collides with a cell tool; the collision is
-//! logged). `tools/call` routes by tool name. Every cell tool additionally
-//! accepts an optional `graph_id` / `graphId` argument: when it names a graph
-//! other than the bound one, the call is routed to `/o/{owner}/g/{that}/mcp`
-//! — **by path**, so the gateway's ACL (the policy-enforcement point) decides,
-//! and sophia-mcp never invents or auto-creates a graph. One upstream session
-//! is cached per graph.
+//! `tools/list` is the union of both catalogs; `tools/call` routes by tool
+//! name. Every cell tool additionally accepts an optional `graph_id` /
+//! `graphId` argument: when it names a graph other than the bound one, the call
+//! is routed to `/o/{listing-owner}/g/{that}/mcp` — **by path**, with the owner
+//! taken from this identity's `list_graphs` (never from an argument), so the
+//! gateway's ACL (the policy-enforcement point) decides and sophia-mcp never
+//! invents or auto-creates a graph. The body is rewritten so the cell sees
+//! exactly one graph argument, equal to the path. One upstream session is
+//! cached per `(owner, graph)`.
 //!
 //! **Routable ≠ boot-ready** (CEL-AVAIL-001). A cell can have a running pod
 //! and still not answer MCP. sophia-mcp therefore treats exactly two things
 //! as proof of routability: the activation record's terminal `ready` phase
 //! *followed by* a successful MCP `initialize` on the cell path. A 200 from any
 //! non-MCP probe (`/health`, `/healthz`, `activate` → `ready:true`) is never
-//! taken as readiness. Waits are bounded (`--activation-timeout`, polled every
-//! `--activation-poll`); on expiry the error names the elapsed seconds and the
-//! last observed activation state — truthfully, never "not found".
+//! taken as readiness. Waits are bounded (`--activation-timeout`; polls every
+//! `--activation-poll`, re-probes with backoff, at most one `activate` per
+//! wait); every HTTP request is bounded by the remaining budget and a
+//! per-request ceiling (`--request-timeout`), so a hung upstream cannot stretch
+//! the wait. On expiry the error names the elapsed seconds and the last
+//! observed activation state — truthfully, never "not found".
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,15 +57,30 @@ pub const PHASE_FAILED: &str = "failed";
 /// pod is deterministic churn (`AppError::CellRepairRequired`).
 const CODE_REPAIR_REQUIRED: &str = "graph_repair_required";
 
-/// Prefix applied to a control tool whose name collides with a cell tool.
+/// `lifecycleState` values under which the gateway will route/activate a graph
+/// (`LifecycleState::is_visible`: provisioning | active | repairing). Rows in
+/// any other state (`tombstoned`, `purging`, `purged`) are listed but never
+/// activated by sophia-mcp.
+const ACTIVATABLE_STATES: [&str; 3] = ["provisioning", "active", "repairing"];
+
+/// Prefix under which every control-plane tool is exposed. Always applied, so
+/// the agent-facing names are stable across cell releases regardless of which
+/// names a cell happens to serve.
 pub const CONTROL_PREFIX: &str = "control_";
+
+/// Re-probe backoff cap, as a multiple of `activation_poll`.
+const BACKOFF_CAP_MULTIPLIER: u32 = 8;
 
 #[derive(Debug, Clone)]
 pub struct GatewayOptions {
     /// Bound wait for a cell to become routable (default 300 s).
     pub activation_timeout: Duration,
-    /// Interval between activation polls / cell-path retries (default 2 s).
+    /// Interval between activation polls; base of the re-probe backoff
+    /// (default 2 s).
     pub activation_poll: Duration,
+    /// Per-request ceiling for any single HTTP request (default 120 s). Wait
+    /// steps are additionally bounded by the remaining activation budget.
+    pub request_timeout: Duration,
     /// Also try `{base}/mcp` for control tools when `/control/mcp` is 404.
     pub unified_mcp_fallback: bool,
 }
@@ -69,13 +90,24 @@ impl Default for GatewayOptions {
         Self {
             activation_timeout: Duration::from_secs(300),
             activation_poll: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(120),
             unified_mcp_fallback: false,
         }
     }
 }
 
-/// One cached upstream session per graph.
+/// A single HTTP request exceeded its bound. Surfaced by name so waits can
+/// record it as the last observation instead of aborting.
+#[derive(Debug, thiserror::Error)]
+#[error("request timed out after {after:.1}s: {what}", after = .after.as_secs_f64())]
+pub struct RequestTimedOut {
+    pub what: String,
+    pub after: Duration,
+}
+
+/// One cached upstream session per `(owner, graph)`.
 struct GraphSession {
+    owner: String,
     graph_id: String,
     mcp_url: String,
     activate_url: String,
@@ -83,17 +115,31 @@ struct GraphSession {
     /// `None` = not (or no longer) proven. Held across the whole wait so
     /// concurrent waiters serialize instead of racing the activation.
     init: tokio::sync::Mutex<Option<Value>>,
-    /// A poll URL handed back by a 202 that has not been consumed yet (set by
-    /// the connect-time activation kick).
+    /// A poll URL handed back by a 202 that has not been consumed yet.
     pending_poll: Mutex<Option<String>>,
     /// The connect-time kick already got `ready:true` from `activate`; the
     /// next wait may go straight to the MCP probe.
     kicked_ready: AtomicBool,
+    /// Last observation made by any waiter on this session, so a waiter that
+    /// times out queued behind another can still report a real state.
+    last_state: Mutex<String>,
 }
 
 impl GraphSession {
     async fn invalidate(&self) {
         *self.init.lock().await = None;
+    }
+
+    fn label(&self) -> String {
+        format!("{}/{}", self.owner, self.graph_id)
+    }
+
+    fn observe(&self, state: &str) {
+        *self.last_state.lock().expect("last_state lock") = state.to_string();
+    }
+
+    fn last_state(&self) -> String {
+        self.last_state.lock().expect("last_state lock").clone()
     }
 }
 
@@ -103,6 +149,16 @@ enum Route {
     Cell,
 }
 
+/// Where a graph id resolved to, per this identity's listing.
+#[derive(Default, Clone)]
+struct Listing {
+    /// graph id → owners under which it is activatable.
+    activatable: HashMap<String, Vec<String>>,
+    /// graph id → (owner, lifecycleState) rows that are listed but NOT
+    /// activatable (tombstoned / purging / purged).
+    dormant: HashMap<String, Vec<(String, String)>>,
+}
+
 pub struct GatewayBackend {
     client: reqwest::Client,
     base: String,
@@ -110,12 +166,13 @@ pub struct GatewayBackend {
     bound_graph: String,
     control_url: String,
     opts: GatewayOptions,
-    sessions: Mutex<HashMap<String, Arc<GraphSession>>>,
+    sessions: Mutex<HashMap<(String, String), Arc<GraphSession>>>,
     /// Merged-name → upstream. Built by `tools/list`; built lazily by
     /// `tools/call` if the agent calls before listing.
-    routing: Mutex<Option<HashMap<String, Route>>>,
-    /// `(owner, graphId)` tuples the control plane listed for this identity.
-    listed: Mutex<HashSet<(String, String)>>,
+    routing: Mutex<HashMap<String, Route>>,
+    catalog_built: AtomicBool,
+    /// This identity's `list_graphs`, replaced wholesale on every refresh.
+    listing: Mutex<Listing>,
     /// The agent's `initialize` params, replayed to each cell on probe.
     client_init_params: Mutex<Value>,
     /// Polls (activation GETs + activate POSTs + MCP probes) spent by the most
@@ -129,9 +186,10 @@ impl GatewayBackend {
     /// Strict, fast parts happen here: the control plane is probed
     /// (`/control/mcp`, optionally `/mcp`) and the tuple must appear in this
     /// identity's `list_graphs` — merely naming an unknown tuple never creates
-    /// it. Activation of the bound graph is *kicked* (one `POST …/activate`)
-    /// but not awaited: call [`GatewayBackend::warm`] for the bounded wait, so
-    /// the stdio `initialize` handshake never blocks on a dormant cell.
+    /// it. Activation of the bound graph is *kicked* (one `POST …/activate`;
+    /// a retryable 5xx there is logged, not fatal) but not awaited: call
+    /// [`GatewayBackend::warm`] for the bounded wait, so the stdio
+    /// `initialize` handshake never blocks on a dormant cell.
     pub async fn connect(
         raw_base: &str,
         owner: &str,
@@ -144,8 +202,13 @@ impl GatewayBackend {
         }
         let base = gateway_base(raw_base);
         let client = build_client(auth)?;
-        let (control_url, graphs) =
-            probe_control(&client, &base, opts.unified_mcp_fallback).await?;
+        let (control_url, graphs) = probe_control(
+            &client,
+            &base,
+            opts.unified_mcp_fallback,
+            opts.request_timeout,
+        )
+        .await?;
         let this = Self {
             client,
             base,
@@ -154,14 +217,15 @@ impl GatewayBackend {
             control_url,
             opts,
             sessions: Mutex::new(HashMap::new()),
-            routing: Mutex::new(None),
-            listed: Mutex::new(HashSet::new()),
+            routing: Mutex::new(HashMap::new()),
+            catalog_built: AtomicBool::new(false),
+            listing: Mutex::new(Listing::default()),
             client_init_params: Mutex::new(default_client_init_params()),
             last_wait_polls: AtomicU64::new(0),
         };
-        this.absorb_listing(&graphs);
-        this.assert_listed(graph).await?;
-        let session = this.session_for(graph);
+        this.replace_listing(&graphs);
+        this.assert_bound_listed()?;
+        let session = this.session_for(owner, graph);
         this.kick_activation(&session).await?;
         Ok(this)
     }
@@ -170,8 +234,11 @@ impl GatewayBackend {
     /// stderr (tracing); the error carries the last observed activation state
     /// and elapsed seconds.
     pub async fn warm(&self) -> anyhow::Result<()> {
-        let session = self.session_for(&self.bound_graph);
-        self.ensure_routable(&session).await.map(|_| ())
+        let session = self.session_for(&self.owner, &self.bound_graph);
+        let started = Instant::now();
+        self.ensure_routable(&session, started + self.opts.activation_timeout, started)
+            .await
+            .map(|_| ())
     }
 
     pub fn bound_graph(&self) -> &str {
@@ -188,10 +255,14 @@ impl GatewayBackend {
 
     /// The cell MCP endpoint for `graph` under this backend's owner.
     pub fn mcp_url_for(&self, graph: &str) -> String {
+        self.mcp_url_of(&self.owner, graph)
+    }
+
+    fn mcp_url_of(&self, owner: &str, graph: &str) -> String {
         format!(
             "{}/o/{}/g/{}/mcp",
             self.base,
-            urlencode_segment(&self.owner),
+            urlencode_segment(owner),
             urlencode_segment(graph)
         )
     }
@@ -204,132 +275,261 @@ impl GatewayBackend {
 
     // ---------------------------------------------------------------- sessions
 
-    fn session_for(&self, graph: &str) -> Arc<GraphSession> {
+    fn session_for(&self, owner: &str, graph: &str) -> Arc<GraphSession> {
         let mut sessions = self.sessions.lock().expect("sessions lock");
         sessions
-            .entry(graph.to_string())
+            .entry((owner.to_string(), graph.to_string()))
             .or_insert_with(|| {
                 Arc::new(GraphSession {
+                    owner: owner.to_string(),
                     graph_id: graph.to_string(),
-                    mcp_url: self.mcp_url_for(graph),
+                    mcp_url: self.mcp_url_of(owner, graph),
                     activate_url: format!(
                         "{}/o/{}/g/{}/activate",
                         self.base,
-                        urlencode_segment(&self.owner),
+                        urlencode_segment(owner),
                         urlencode_segment(graph)
                     ),
                     init: tokio::sync::Mutex::new(None),
                     pending_poll: Mutex::new(None),
                     kicked_ready: AtomicBool::new(false),
+                    last_state: Mutex::new("no activation observation yet".to_string()),
                 })
             })
             .clone()
     }
 
-    fn absorb_listing(&self, graphs: &[Value]) {
-        let mut listed = self.listed.lock().expect("listed lock");
+    // ---------------------------------------------------------------- listing
+
+    /// Replace (never union) the listing: a row that disappears is forgotten,
+    /// a row whose `lifecycleState` is not activatable is remembered only to
+    /// explain a refusal.
+    fn replace_listing(&self, graphs: &[Value]) {
+        let mut next = Listing::default();
         for item in graphs {
-            if let (Some(owner), Some(graph)) = (
+            let (Some(owner), Some(graph)) = (
                 item.get("owner").and_then(Value::as_str),
                 item.get("graphId").and_then(Value::as_str),
-            ) {
-                listed.insert((owner.to_string(), graph.to_string()));
+            ) else {
+                continue;
+            };
+            let state = item
+                .get("lifecycleState")
+                .and_then(Value::as_str)
+                .map(|s| s.to_ascii_lowercase());
+            let activatable = state
+                .as_deref()
+                .map(|s| ACTIVATABLE_STATES.contains(&s))
+                .unwrap_or(true);
+            if activatable {
+                next.activatable
+                    .entry(graph.to_string())
+                    .or_default()
+                    .push(owner.to_string());
+            } else {
+                next.dormant.entry(graph.to_string()).or_default().push((
+                    owner.to_string(),
+                    state.unwrap_or_default(),
+                ));
             }
         }
+        tracing::debug!(
+            activatable = next.activatable.len(),
+            not_activatable = next.dormant.len(),
+            "list_graphs absorbed"
+        );
+        *self.listing.lock().expect("listing lock") = next;
     }
 
-    fn is_listed(&self, graph: &str) -> bool {
-        self.listed
-            .lock()
-            .expect("listed lock")
-            .contains(&(self.owner.clone(), graph.to_string()))
-    }
-
-    /// The tuple must be in this identity's `list_graphs`. Refreshes the
-    /// listing once on a miss (a graph created after connect). Never touches
-    /// the graph path for an unlisted tuple.
-    async fn assert_listed(&self, graph: &str) -> anyhow::Result<()> {
-        if self.is_listed(graph) {
-            return Ok(());
-        }
-        let graphs = control_list_graphs(&self.client, &self.control_url)
+    async fn refresh_listing(&self) -> anyhow::Result<()> {
+        let graphs = self
+            .bounded(
+                &format!("POST {} (list_graphs)", self.control_url),
+                None,
+                async {
+                    control_list_graphs(&self.client, &self.control_url)
+                        .await
+                        .map_err(anyhow::Error::from)
+                },
+            )
             .await
             .context("refresh list_graphs through the control plane")?;
-        self.absorb_listing(&graphs);
-        if self.is_listed(graph) {
+        self.replace_listing(&graphs);
+        Ok(())
+    }
+
+    fn owners_of(&self, graph: &str) -> Vec<String> {
+        self.listing
+            .lock()
+            .expect("listing lock")
+            .activatable
+            .get(graph)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn not_listed_error(&self, graph: &str) -> anyhow::Error {
+        let dormant = self
+            .listing
+            .lock()
+            .expect("listing lock")
+            .dormant
+            .get(graph)
+            .cloned()
+            .unwrap_or_default();
+        if dormant.is_empty() {
+            anyhow!(
+                "graph '{graph}' is not in this identity's list_graphs; \
+                 sophia-mcp will not activate or create it"
+            )
+        } else {
+            let rows: Vec<String> = dormant
+                .iter()
+                .map(|(owner, state)| format!("{owner} (lifecycleState '{state}')"))
+                .collect();
+            anyhow!(
+                "graph '{graph}' is listed but not activatable — {}; \
+                 sophia-mcp will not activate it",
+                rows.join(", ")
+            )
+        }
+    }
+
+    /// The bound tuple must be listed under exactly the `--owner` given.
+    fn assert_bound_listed(&self) -> anyhow::Result<()> {
+        if self.owners_of(&self.bound_graph).iter().any(|o| o == &self.owner) {
             return Ok(());
         }
-        Err(anyhow!(
-            "graph '{graph}' (owner {}) is not in this identity's list_graphs; \
-             sophia-mcp will not activate or create it",
-            self.owner
-        ))
+        let err = self.not_listed_error(&self.bound_graph);
+        Err(anyhow!("{err:#} (owner {})", self.owner))
+    }
+
+    /// Resolve a `graph_id` argument to the `(owner, graph)` tuple this
+    /// identity's listing names for it — never an argument's owner. Refreshes
+    /// the listing once on a miss. Ambiguity (same id under two owners) is
+    /// refused naming both.
+    async fn resolve_sibling(&self, graph: &str) -> anyhow::Result<(String, String)> {
+        let mut owners = self.owners_of(graph);
+        if owners.is_empty() {
+            self.refresh_listing().await?;
+            owners = self.owners_of(graph);
+        }
+        match owners.as_slice() {
+            [] => Err(self.not_listed_error(graph)),
+            [owner] => Ok((owner.clone(), graph.to_string())),
+            many => Err(anyhow!(
+                "graph id '{graph}' is ambiguous in this identity's list_graphs — listed under {}; \
+                 sophia-mcp will not guess an owner",
+                many.join(" and ")
+            )),
+        }
     }
 
     // -------------------------------------------------------------- activation
 
     /// One `POST …/activate` to start waking the cell. Records the poll URL
-    /// (202) or the ready claim (200) for the next wait; surfaces the
-    /// gateway's own 4xx verbatim.
+    /// (202) or the ready claim (200) for the next wait; a retryable 5xx or a
+    /// request timeout is logged and left to the first use; the gateway's own
+    /// 4xx is surfaced verbatim.
     async fn kick_activation(&self, session: &GraphSession) -> anyhow::Result<()> {
-        let reply = self.post_activate(session).await?;
+        let reply = match self
+            .bounded(
+                &format!("POST {}", session.activate_url),
+                None,
+                self.post_activate(session),
+            )
+            .await
+        {
+            Ok(reply) => reply,
+            Err(e) if e.is::<RequestTimedOut>() => {
+                session.observe(&format!("{e:#}"));
+                tracing::warn!(graph = %session.label(), "activation kick timed out; first use will wait: {e:#}");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let body = reply.json();
         match reply.status {
             StatusCode::ACCEPTED => {
-                let body = reply.json();
-                let phase = body
-                    .pointer("/activation/phase")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
+                let state = describe_activation(body.get("activation").unwrap_or(&Value::Null));
                 if let Some(poll) = body.get("pollUrl").and_then(Value::as_str) {
                     *session.pending_poll.lock().expect("pending lock") =
-                        Some(self.absolute(poll));
+                        Some(self.same_origin(poll)?);
                 }
+                session.observe(&state);
                 tracing::info!(
-                    graph = %session.graph_id,
-                    phase,
+                    graph = %session.label(),
+                    state = %state,
                     "activation started; will wait for routability on first use"
                 );
                 Ok(())
             }
             s if s.is_success() => {
                 session.kicked_ready.store(true, Ordering::SeqCst);
+                session.observe(READY_CLAIM);
                 tracing::info!(
-                    graph = %session.graph_id,
+                    graph = %session.label(),
                     "activate reports a running cell (ready:true) — not yet proven routable"
                 );
                 Ok(())
             }
-            s => Err(self.gateway_rejection(&session.graph_id, "activate", s, &reply.body)),
+            s if is_retryable(s, &body) => {
+                let state = format!("activate answered HTTP {s}: {}", reply.body.trim());
+                session.observe(&state);
+                tracing::warn!(
+                    graph = %session.label(),
+                    state = %state,
+                    "activation kick answered a retryable status; first use will wait"
+                );
+                Ok(())
+            }
+            s => Err(self.gateway_rejection(&session.label(), "activate", s, &reply.body)),
         }
     }
 
     /// Cached `initialize` result if the session is proven routable, else run
-    /// the bounded wait. The budget starts when this waiter gets the session
-    /// lock, so a waiter queued behind another does not inherit its clock.
-    async fn ensure_routable(&self, session: &Arc<GraphSession>) -> anyhow::Result<Value> {
-        let mut guard = session.init.lock().await;
+    /// the bounded wait — against the CALLER's deadline, including the time
+    /// spent queued behind another waiter on the same session.
+    async fn ensure_routable(
+        &self,
+        session: &Arc<GraphSession>,
+        deadline: Instant,
+        started: Instant,
+    ) -> anyhow::Result<Value> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let mut guard = match tokio::time::timeout(remaining, session.init.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                let state = format!("(queued behind another waiter) {}", session.last_state());
+                return Err(self.timeout_error(&session.label(), started, 0, "polls", &state));
+            }
+        };
         if let Some(init) = guard.as_ref() {
             return Ok(init.clone());
         }
-        let init = self.wait_for_routable(session).await?;
+        let init = self.wait_for_routable(session, deadline, started).await?;
         *guard = Some(init.clone());
         Ok(init)
     }
 
-    /// The wait state machine: activate → poll `/activations/{id}` until
-    /// terminal → prove with MCP `initialize` on the cell path → repeat on
-    /// 202/502/503, all bounded by `activation_timeout`.
-    async fn wait_for_routable(&self, session: &GraphSession) -> anyhow::Result<Value> {
+    /// The wait state machine: activate (at most once per wait) → poll
+    /// `/activations/{id}` until terminal → prove with MCP `initialize` on the
+    /// cell path → re-probe with backoff on 202/502/503, all bounded by the
+    /// caller's deadline.
+    async fn wait_for_routable(
+        &self,
+        session: &GraphSession,
+        deadline: Instant,
+        started: Instant,
+    ) -> anyhow::Result<Value> {
         enum Step {
             Activate,
             Poll(String),
             Probe,
         }
-        let started = Instant::now();
-        let deadline = started + self.opts.activation_timeout;
-        let graph = session.graph_id.as_str();
+        let label = session.label();
         let mut polls: u64 = 0;
-        let mut last_state = String::from("no activation observation yet");
+        let mut last_state = session.last_state();
         let mut step = if let Some(url) = session.pending_poll.lock().expect("pending lock").take()
         {
             Step::Poll(url)
@@ -338,153 +538,214 @@ impl GatewayBackend {
         } else {
             Step::Activate
         };
+        // The connect-time kick already POSTed activate for Poll/Probe starts.
+        let mut activated = !matches!(step, Step::Activate);
+        let poll = self.opts.activation_poll;
+        let backoff_cap = poll * BACKOFF_CAP_MULTIPLIER;
+        let mut backoff = poll;
         loop {
+            session.observe(&last_state);
             if Instant::now() >= deadline {
                 self.last_wait_polls.store(polls, Ordering::SeqCst);
-                return Err(self.timeout_error(graph, started, polls, &last_state));
+                return Err(self.timeout_error(&label, started, polls, "polls", &last_state));
             }
-            match step {
+            let sleep_for = match step {
                 Step::Activate => {
+                    activated = true;
                     polls += 1;
-                    let reply = self.post_activate(session).await?;
-                    let body = reply.json();
-                    match reply.status {
-                        StatusCode::ACCEPTED => {
-                            last_state = describe_activation(
-                                body.get("activation").unwrap_or(&Value::Null),
-                            );
-                            match body.get("pollUrl").and_then(Value::as_str) {
-                                Some(poll) => {
-                                    step = Step::Poll(self.absolute(poll));
-                                    continue;
-                                }
-                                None => {
-                                    last_state.push_str(" (202 without pollUrl)");
-                                }
-                            }
-                        }
-                        s if s.is_success() => {
-                            last_state = "activate reports ready:true (a running pod — \
-                                          not yet proven routable)"
-                                .to_string();
-                            step = Step::Probe;
-                            continue;
-                        }
-                        s if is_retryable(s, &body) => {
-                            last_state = format!("activate answered HTTP {s}: {}", reply.body.trim());
-                        }
-                        s => {
-                            return Err(self.gateway_rejection(graph, "activate", s, &reply.body))
-                        }
-                    }
-                    tracing::info!(graph, polls, state = %last_state, "waiting for activation");
-                    tokio::time::sleep(self.opts.activation_poll).await;
-                }
-                Step::Poll(ref url) => {
-                    polls += 1;
-                    let reply = self.get(url).await?;
-                    let body = reply.json();
-                    match reply.status {
-                        s if s.is_success() => {
-                            last_state = describe_activation(&body);
-                            match body.get("phase").and_then(Value::as_str) {
-                                Some(PHASE_READY) => {
-                                    tracing::info!(
-                                        graph,
-                                        polls,
-                                        "activation reached phase=ready; probing MCP"
+                    let what = format!("POST {}", session.activate_url);
+                    match self
+                        .bounded(&what, Some(deadline), self.post_activate(session))
+                        .await
+                    {
+                        Ok(reply) => {
+                            let body = reply.json();
+                            match reply.status {
+                                StatusCode::ACCEPTED => {
+                                    last_state = describe_activation(
+                                        body.get("activation").unwrap_or(&Value::Null),
                                     );
+                                    match body.get("pollUrl").and_then(Value::as_str) {
+                                        Some(url) => {
+                                            step = Step::Poll(self.same_origin(url)?);
+                                            continue;
+                                        }
+                                        None => {
+                                            last_state.push_str(" (202 without pollUrl)");
+                                            step = Step::Probe;
+                                        }
+                                    }
+                                }
+                                s if s.is_success() => {
+                                    last_state = READY_CLAIM.to_string();
                                     step = Step::Probe;
                                     continue;
                                 }
-                                Some(PHASE_FAILED) => {
-                                    self.last_wait_polls.store(polls, Ordering::SeqCst);
-                                    return Err(anyhow!(
-                                        "graph '{}/{graph}' activation failed after {}s: {}",
-                                        self.owner,
-                                        started.elapsed().as_secs(),
-                                        body.get("error")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("no error detail")
-                                    ));
+                                s if is_retryable(s, &body) => {
+                                    last_state = format!(
+                                        "activate answered HTTP {s}: {}",
+                                        reply.body.trim()
+                                    );
+                                    step = Step::Probe;
                                 }
-                                _ => {}
+                                s => {
+                                    return Err(self.gateway_rejection(
+                                        &label,
+                                        "activate",
+                                        s,
+                                        &reply.body,
+                                    ))
+                                }
                             }
                         }
-                        s if is_retryable(s, &body) => {
-                            last_state =
-                                format!("activation poll answered HTTP {s}: {}", reply.body.trim());
+                        Err(e) if e.is::<RequestTimedOut>() => {
+                            last_state = format!("{e:#}");
+                            step = Step::Probe;
                         }
-                        s => {
-                            return Err(self.gateway_rejection(
-                                graph,
-                                "activation poll",
-                                s,
-                                &reply.body,
-                            ))
-                        }
+                        Err(e) => return Err(e),
                     }
-                    tracing::info!(graph, polls, state = %last_state, "waiting for activation");
-                    tokio::time::sleep(self.opts.activation_poll).await;
+                    tracing::info!(graph = %label, polls, state = %last_state, "waiting for activation");
+                    poll
+                }
+                Step::Poll(ref url) => {
+                    polls += 1;
+                    let what = format!("GET {url}");
+                    match self.bounded(&what, Some(deadline), self.get(url)).await {
+                        Ok(reply) => {
+                            let body = reply.json();
+                            match reply.status {
+                                s if s.is_success() => {
+                                    last_state = describe_activation(&body);
+                                    match body.get("phase").and_then(Value::as_str) {
+                                        Some(PHASE_READY) => {
+                                            tracing::info!(
+                                                graph = %label,
+                                                polls,
+                                                "activation reached phase=ready; probing MCP"
+                                            );
+                                            step = Step::Probe;
+                                            continue;
+                                        }
+                                        Some(PHASE_FAILED) => {
+                                            self.last_wait_polls.store(polls, Ordering::SeqCst);
+                                            session.observe(&last_state);
+                                            return Err(anyhow!(
+                                                "graph '{label}' activation failed after {:.1}s: {}",
+                                                started.elapsed().as_secs_f64(),
+                                                body.get("error")
+                                                    .and_then(Value::as_str)
+                                                    .unwrap_or("no error detail")
+                                            ));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                s if is_retryable(s, &body) => {
+                                    last_state = format!(
+                                        "activation poll answered HTTP {s}: {}",
+                                        reply.body.trim()
+                                    );
+                                }
+                                s => {
+                                    return Err(self.gateway_rejection(
+                                        &label,
+                                        "activation poll",
+                                        s,
+                                        &reply.body,
+                                    ))
+                                }
+                            }
+                        }
+                        Err(e) if e.is::<RequestTimedOut>() => {
+                            last_state = format!("{e:#}");
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    tracing::info!(graph = %label, polls, state = %last_state, "waiting for activation");
+                    poll
                 }
                 Step::Probe => {
                     polls += 1;
                     let params = self.client_init_params.lock().expect("init lock").clone();
-                    let reply =
-                        post_rpc(&self.client, &session.mcp_url, method::INITIALIZE, params).await?;
-                    match classify_cell_reply(reply) {
-                        CellReply::Result(init) => {
-                            self.last_wait_polls.store(polls, Ordering::SeqCst);
-                            tracing::info!(
-                                graph,
-                                polls,
-                                elapsed_s = started.elapsed().as_secs(),
-                                "cell routable (MCP initialize succeeded)"
-                            );
-                            return Ok(init);
-                        }
-                        CellReply::RpcError { code, message } => {
-                            self.last_wait_polls.store(polls, Ordering::SeqCst);
-                            return Err(anyhow!(
-                                "cell for graph '{}/{graph}' answered initialize with JSON-RPC error {code}: {message}",
-                                self.owner
-                            ));
-                        }
-                        CellReply::Activating { poll_url, state } => {
-                            last_state = state;
-                            if let Some(poll) = poll_url {
-                                step = Step::Poll(self.absolute(&poll));
-                                continue;
+                    let what = format!("POST {} (initialize)", session.mcp_url);
+                    match self
+                        .bounded(
+                            &what,
+                            Some(deadline),
+                            post_rpc(&self.client, &session.mcp_url, method::INITIALIZE, params),
+                        )
+                        .await
+                    {
+                        Ok(reply) => match classify_cell_reply(reply) {
+                            CellReply::Result(init) => {
+                                self.last_wait_polls.store(polls, Ordering::SeqCst);
+                                session.observe("routable (MCP initialize succeeded)");
+                                tracing::info!(
+                                    graph = %label,
+                                    polls,
+                                    elapsed_s = format!("{:.1}", started.elapsed().as_secs_f64()),
+                                    "cell routable (MCP initialize succeeded)"
+                                );
+                                return Ok(init);
                             }
-                            step = Step::Activate;
+                            CellReply::RpcError { code, message } => {
+                                self.last_wait_polls.store(polls, Ordering::SeqCst);
+                                return Err(anyhow!(
+                                    "cell for graph '{label}' answered initialize with JSON-RPC error {code}: {message}"
+                                ));
+                            }
+                            CellReply::Activating { poll_url, state } => {
+                                last_state = state;
+                                if let Some(url) = poll_url {
+                                    step = Step::Poll(self.same_origin(&url)?);
+                                    continue;
+                                }
+                                if !activated {
+                                    step = Step::Activate;
+                                    continue;
+                                }
+                            }
+                            CellReply::Unavailable { status, body } => {
+                                last_state =
+                                    format!("cell path answered HTTP {status}: {}", body.trim());
+                                if !activated {
+                                    step = Step::Activate;
+                                    continue;
+                                }
+                            }
+                            CellReply::Rejected { status, body } => {
+                                self.last_wait_polls.store(polls, Ordering::SeqCst);
+                                return Err(self.gateway_rejection(&label, "mcp", status, &body));
+                            }
+                        },
+                        Err(e) if e.is::<RequestTimedOut>() => {
+                            last_state = format!("{e:#}");
                         }
-                        CellReply::Unavailable { status, body } => {
-                            last_state = format!("cell path answered HTTP {status}: {}", body.trim());
-                            step = Step::Activate;
-                        }
-                        CellReply::Rejected { status, body } => {
-                            self.last_wait_polls.store(polls, Ordering::SeqCst);
-                            return Err(self.gateway_rejection(graph, "mcp", status, &body));
-                        }
+                        Err(e) => return Err(e),
                     }
-                    tracing::info!(graph, polls, state = %last_state, "cell not routable yet");
-                    tokio::time::sleep(self.opts.activation_poll).await;
+                    tracing::info!(graph = %label, polls, state = %last_state, "cell not routable yet");
+                    let this = backoff;
+                    backoff = (backoff * 2).min(backoff_cap);
+                    this
                 }
-            }
+            };
+            session.observe(&last_state);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(sleep_for.min(remaining)).await;
         }
     }
 
     fn timeout_error(
         &self,
-        graph: &str,
+        label: &str,
         started: Instant,
-        polls: u64,
+        count: u64,
+        count_kind: &str,
         last_state: &str,
     ) -> anyhow::Error {
         anyhow!(
-            "graph '{}/{graph}' is not routable after {:.1}s (activation budget {:.1}s, {polls} polls); \
+            "graph '{label}' is not routable after {:.1}s (activation budget {:.1}s, {count} {count_kind}); \
              last observed activation state: {last_state}",
-            self.owner,
             started.elapsed().as_secs_f64(),
             self.opts.activation_timeout.as_secs_f64()
         )
@@ -495,16 +756,48 @@ impl GatewayBackend {
     /// reinterpret its verdicts.
     fn gateway_rejection(
         &self,
-        graph: &str,
+        label: &str,
         what: &str,
         status: StatusCode,
         body: &str,
     ) -> anyhow::Error {
         anyhow!(
-            "gateway returned HTTP {status} for {what} of graph '{}/{graph}': {}",
-            self.owner,
+            "gateway returned HTTP {status} for {what} of graph '{label}': {}",
             body.trim()
         )
+    }
+
+    /// Bound one request by the per-request ceiling and, when given, the
+    /// caller's remaining activation budget.
+    async fn bounded<T, F>(
+        &self,
+        what: &str,
+        deadline: Option<Instant>,
+        fut: F,
+    ) -> anyhow::Result<T>
+    where
+        F: Future<Output = anyhow::Result<T>>,
+    {
+        let mut limit = self.opts.request_timeout;
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(RequestTimedOut {
+                    what: what.to_string(),
+                    after: Duration::ZERO,
+                }
+                .into());
+            }
+            limit = limit.min(remaining);
+        }
+        match tokio::time::timeout(limit, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(RequestTimedOut {
+                what: what.to_string(),
+                after: limit,
+            }
+            .into()),
+        }
     }
 
     async fn post_activate(&self, session: &GraphSession) -> anyhow::Result<HttpReply> {
@@ -531,24 +824,40 @@ impl GatewayBackend {
         Ok(HttpReply { status, body })
     }
 
-    fn absolute(&self, url: &str) -> String {
-        if url.starts_with("http://") || url.starts_with("https://") {
-            url.to_string()
-        } else {
-            format!("{}/{}", self.base, url.trim_start_matches('/'))
+    /// A poll URL is followed only on the gateway's own origin: relative, or
+    /// absolute under `self.base`. Anything else would carry the bearer +
+    /// on-behalf-of headers off-origin, so it is refused.
+    fn same_origin(&self, url: &str) -> anyhow::Result<String> {
+        if url.starts_with('/') {
+            return Ok(format!("{}{url}", self.base));
         }
+        if url == self.base || url.starts_with(&format!("{}/", self.base)) {
+            return Ok(url.to_string());
+        }
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Ok(format!("{}/{url}", self.base));
+        }
+        Err(anyhow!(
+            "refusing to follow off-origin pollUrl '{url}' (gateway base is {}); credentials stay on-origin",
+            self.base
+        ))
     }
 
     // ------------------------------------------------------------------- rpc
 
     async fn control_rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let reply = post_rpc(&self.client, &self.control_url, method, params).await?;
+        let what = format!("POST {} ({method})", self.control_url);
+        let reply = self
+            .bounded(&what, None, post_rpc(&self.client, &self.control_url, method, params))
+            .await?;
         rpc_result(reply, method).with_context(|| format!("control plane {}", self.control_url))
     }
 
     /// One MCP call against a graph cell, with wait-for-routable before and
     /// retry-after-wait on any 202/502/503 answer, bounded by the activation
-    /// budget measured from this call's start.
+    /// budget measured from this call's start. The call itself is bounded by
+    /// the per-request ceiling only (a legitimate long tool call is not an
+    /// activation problem).
     async fn cell_rpc(
         &self,
         session: &Arc<GraphSession>,
@@ -559,8 +868,15 @@ impl GatewayBackend {
         let deadline = started + self.opts.activation_timeout;
         let mut retries: u64 = 0;
         loop {
-            self.ensure_routable(session).await?;
-            let reply = post_rpc(&self.client, &session.mcp_url, method, params.clone()).await?;
+            self.ensure_routable(session, deadline, started).await?;
+            let what = format!("POST {} ({method})", session.mcp_url);
+            let reply = self
+                .bounded(
+                    &what,
+                    None,
+                    post_rpc(&self.client, &session.mcp_url, method, params.clone()),
+                )
+                .await?;
             let state = match classify_cell_reply(reply) {
                 CellReply::Result(value) => return Ok(value),
                 CellReply::RpcError { code, message } => {
@@ -569,12 +885,12 @@ impl GatewayBackend {
                     ))
                 }
                 CellReply::Rejected { status, body } => {
-                    return Err(self.gateway_rejection(&session.graph_id, method, status, &body))
+                    return Err(self.gateway_rejection(&session.label(), method, status, &body))
                 }
                 CellReply::Activating { poll_url, state } => {
-                    if let Some(poll) = poll_url {
+                    if let Some(url) = poll_url {
                         *session.pending_poll.lock().expect("pending lock") =
-                            Some(self.absolute(&poll));
+                            Some(self.same_origin(&url)?);
                     }
                     state
                 }
@@ -583,62 +899,63 @@ impl GatewayBackend {
                 }
             };
             session.invalidate().await;
+            session.observe(&state);
             retries += 1;
             tracing::warn!(
-                graph = %session.graph_id,
+                graph = %session.label(),
                 method,
                 retries,
                 state = %state,
                 "cell answered not-routable mid-session; re-waiting for activation"
             );
             if Instant::now() >= deadline {
-                return Err(self.timeout_error(&session.graph_id, started, retries, &state));
+                return Err(self.timeout_error(&session.label(), started, retries, "retries", &state));
             }
-            tokio::time::sleep(self.opts.activation_poll).await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(self.opts.activation_poll.min(remaining)).await;
         }
     }
 
     // --------------------------------------------------------------- routing
 
-    /// Fetch both catalogs, merge them, and (re)build the routing table.
+    /// Fetch both catalogs, merge them, and (re)build the routing table. A
+    /// paginated request (`cursor` present) extends the table instead of
+    /// replacing it; control tools are appended only on the last page.
     async fn refresh_catalog(&self, params: Value) -> anyhow::Result<Value> {
+        let paged = params.get("cursor").is_some_and(|c| !c.is_null());
         let control = self.control_rpc(method::TOOLS_LIST, json!({})).await?;
-        let session = self.session_for(&self.bound_graph);
+        let session = self.session_for(&self.owner, &self.bound_graph);
         let cell = self.cell_rpc(&session, method::TOOLS_LIST, params).await?;
         let merged = merge_catalogs(&cell, &control, &self.bound_graph);
-        for name in &merged.collisions {
-            tracing::warn!(
-                tool = %name,
-                renamed = %format!("{CONTROL_PREFIX}{name}"),
-                "control tool name collides with a cell tool; control tool exposed under the prefixed name"
-            );
-        }
         tracing::info!(
             cell_tools = merged.cell_count,
             control_tools = merged.control_count,
-            collisions = merged.collisions.len(),
+            control_appended = merged.control_appended,
+            paged,
             "merged tool catalog"
         );
-        *self.routing.lock().expect("routing lock") = Some(merged.routes);
+        {
+            let mut routing = self.routing.lock().expect("routing lock");
+            if !paged {
+                routing.clear();
+            }
+            routing.extend(merged.routes);
+        }
+        self.catalog_built.store(true, Ordering::SeqCst);
         Ok(merged.result)
     }
 
     async fn route_for(&self, name: &str) -> anyhow::Result<Option<Route>> {
-        let known = self.routing.lock().expect("routing lock").clone();
-        let routes = match known {
-            Some(routes) => routes,
-            None => {
-                self.refresh_catalog(json!({})).await?;
-                self.routing
-                    .lock()
-                    .expect("routing lock")
-                    .clone()
-                    .unwrap_or_default()
-            }
-        };
-        Ok(routes.get(name).cloned())
+        if !self.catalog_built.load(Ordering::SeqCst) {
+            self.refresh_catalog(json!({})).await?;
+        }
+        Ok(self.routing.lock().expect("routing lock").get(name).cloned())
     }
 }
+
+/// `activate` answered 200 `ready:true`: a running pod, which per
+/// CEL-AVAIL-001 is not proof of routability.
+const READY_CLAIM: &str = "activate reports ready:true (a running pod — not yet proven routable)";
 
 #[async_trait]
 impl Backend for GatewayBackend {
@@ -661,7 +978,7 @@ impl Backend for GatewayBackend {
         self.refresh_catalog(params).await
     }
 
-    async fn call_tool(&self, params: Value) -> anyhow::Result<Value> {
+    async fn call_tool(&self, mut params: Value) -> anyhow::Result<Value> {
         let name = params
             .get("name")
             .and_then(Value::as_str)
@@ -670,18 +987,26 @@ impl Backend for GatewayBackend {
         match self.route_for(&name).await? {
             None => Err(ToolNotFound(name).into()),
             Some(Route::Control { upstream_name }) => {
-                let mut upstream = params.clone();
-                upstream["name"] = json!(upstream_name);
-                self.control_rpc(method::TOOLS_CALL, upstream).await
+                params["name"] = json!(upstream_name);
+                self.control_rpc(method::TOOLS_CALL, params).await
             }
             Some(Route::Cell) => {
-                let target = requested_graph(params.get("arguments"))
-                    .unwrap_or_else(|| self.bound_graph.clone());
-                if target != self.bound_graph {
-                    self.assert_listed(&target).await?;
-                    tracing::info!(tool = %name, graph = %target, "routing cell tool to sibling graph");
-                }
-                let session = self.session_for(&target);
+                // Refused before any request when the two spellings disagree.
+                let requested = requested_graph(params.get("arguments"))?;
+                let (owner, graph) = match requested.as_deref() {
+                    None => (self.owner.clone(), self.bound_graph.clone()),
+                    Some(g) if g == self.bound_graph => {
+                        (self.owner.clone(), self.bound_graph.clone())
+                    }
+                    Some(g) => {
+                        let target = self.resolve_sibling(g).await?;
+                        tracing::info!(tool = %name, owner = %target.0, graph = %target.1, "routing cell tool to sibling graph");
+                        target
+                    }
+                };
+                // The cell sees exactly one graph argument, equal to the path.
+                normalize_graph_arguments(&mut params, &graph);
+                let session = self.session_for(&owner, &graph);
                 self.cell_rpc(&session, method::TOOLS_CALL, params).await
             }
         }
@@ -713,9 +1038,22 @@ async fn probe_control(
     client: &reqwest::Client,
     base: &str,
     unified_fallback: bool,
+    request_timeout: Duration,
 ) -> anyhow::Result<(String, Vec<Value>)> {
     let primary = format!("{base}/control/mcp");
-    match control_list_graphs(client, &primary).await {
+    let attempt = |url: String| async move {
+        match tokio::time::timeout(request_timeout, control_list_graphs(client, &url)).await {
+            Ok(result) => result,
+            Err(_) => Err(ControlError::Other(
+                RequestTimedOut {
+                    what: format!("POST {url} (list_graphs)"),
+                    after: request_timeout,
+                }
+                .into(),
+            )),
+        }
+    };
+    match attempt(primary.clone()).await {
         Ok(graphs) => Ok((primary, graphs)),
         Err(ControlError::NotFound(body)) if unified_fallback => {
             let unified = format!("{base}/mcp");
@@ -724,7 +1062,7 @@ async fn probe_control(
                 body = %body,
                 "control plane 404 at /control/mcp; trying unified /mcp"
             );
-            let graphs = control_list_graphs(client, &unified)
+            let graphs = attempt(unified.clone())
                 .await
                 .with_context(|| format!("list accessible graph cells through {unified}"))?;
             Ok((unified, graphs))
@@ -765,16 +1103,57 @@ async fn control_list_graphs(
     Ok(graphs)
 }
 
-/// A graph named by the tool arguments (`graph_id` or `graphId`, non-empty
-/// string), else `None`.
-fn requested_graph(arguments: Option<&Value>) -> Option<String> {
-    let args = arguments?.as_object()?;
-    ["graph_id", "graphId"]
-        .iter()
-        .find_map(|key| args.get(*key).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+/// The graph named by the tool arguments via `graph_id` and/or `graphId`.
+/// Both may be present only if they agree; a non-string value is refused;
+/// `null` / blank counts as absent.
+fn requested_graph(arguments: Option<&Value>) -> anyhow::Result<Option<String>> {
+    let Some(args) = arguments.and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let mut found: Option<(&str, String)> = None;
+    for key in ["graph_id", "graphId"] {
+        match args.get(key) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(raw)) => {
+                let value = raw.trim();
+                if value.is_empty() {
+                    continue;
+                }
+                match &found {
+                    Some((prev_key, prev)) if prev != value => {
+                        return Err(anyhow!(
+                            "{prev_key} ('{prev}') and {key} ('{value}') disagree; name exactly one graph"
+                        ));
+                    }
+                    _ => found = Some((key, value.to_string())),
+                }
+            }
+            Some(other) => {
+                return Err(anyhow!(
+                    "{key} must be a string naming one of your listed graphs, got {other}"
+                ));
+            }
+        }
+    }
+    Ok(found.map(|(_, value)| value))
+}
+
+/// Rewrite the call body so the target cell sees exactly one graph argument,
+/// equal to the routed path: whichever spelling the agent used is kept (both
+/// → `graph_id`) and set to `graph`; the other spelling is removed. A call
+/// with neither spelling is left untouched (the cell answers about itself).
+fn normalize_graph_arguments(params: &mut Value, graph: &str) {
+    let Some(args) = params.get_mut("arguments").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let has_snake = args.contains_key("graph_id");
+    let has_camel = args.contains_key("graphId");
+    if has_snake {
+        args.insert("graph_id".into(), json!(graph));
+        args.remove("graphId");
+    } else if has_camel {
+        args.insert("graphId".into(), json!(graph));
+    }
 }
 
 /// Gateway 5xx that a later retry may clear (cold cell, capacity, lease
@@ -866,18 +1245,19 @@ fn classify_cell_reply(reply: HttpReply) -> CellReply {
 struct Merged {
     result: Value,
     routes: HashMap<String, Route>,
-    collisions: Vec<String>,
     cell_count: usize,
     control_count: usize,
+    control_appended: bool,
 }
 
 /// Union of the cell catalog (first, augmented with `graph_id`/`graphId`) and
-/// the control catalog (renamed with [`CONTROL_PREFIX`] only on collision).
-/// `nextCursor` from the cell list, if any, is preserved.
+/// the control catalog (always under [`CONTROL_PREFIX`]). Control tools are
+/// appended only when the cell list has no `nextCursor` (i.e. this is the
+/// last page); their routes are registered regardless. `nextCursor` from the
+/// cell list, if any, is preserved.
 fn merge_catalogs(cell: &Value, control: &Value, bound_graph: &str) -> Merged {
     let mut tools: Vec<Value> = Vec::new();
     let mut routes: HashMap<String, Route> = HashMap::new();
-    let mut collisions = Vec::new();
 
     let cell_tools = cell
         .get("tools")
@@ -892,6 +1272,8 @@ fn merge_catalogs(cell: &Value, control: &Value, bound_graph: &str) -> Merged {
         }
     }
     let cell_count = tools.len();
+    let next_cursor = cell.get("nextCursor").filter(|c| !c.is_null()).cloned();
+    let control_appended = next_cursor.is_none();
 
     let control_tools = control
         .get("tools")
@@ -903,45 +1285,43 @@ fn merge_catalogs(cell: &Value, control: &Value, bound_graph: &str) -> Merged {
         let Some(name) = tool.get("name").and_then(Value::as_str).map(str::to_string) else {
             continue;
         };
-        let exposed = if routes.contains_key(&name) {
-            collisions.push(name.clone());
-            let renamed = format!("{CONTROL_PREFIX}{name}");
-            tool["name"] = json!(renamed);
-            renamed
-        } else {
-            name.clone()
-        };
+        let exposed = format!("{CONTROL_PREFIX}{name}");
+        tool["name"] = json!(exposed);
         routes.insert(
             exposed,
             Route::Control {
                 upstream_name: name,
             },
         );
-        tools.push(tool);
+        if control_appended {
+            tools.push(tool);
+        }
         control_count += 1;
     }
 
     let mut result = json!({ "tools": tools });
-    if let Some(cursor) = cell.get("nextCursor") {
-        result["nextCursor"] = cursor.clone();
+    if let Some(cursor) = next_cursor {
+        result["nextCursor"] = cursor;
     }
     Merged {
         result,
         routes,
-        collisions,
         cell_count,
         control_count,
+        control_appended,
     }
 }
 
 /// Add optional `graph_id` + `graphId` string properties to a cell tool's
-/// input schema when absent, so the agent learns it can route the call to a
-/// sibling graph of the same owner.
+/// input schema when absent, so the agent learns it can route the call to
+/// another listed graph.
 fn add_graph_argument(tool: &mut Value, bound_graph: &str) {
     let description = format!(
-        "Optional. Route this call to another graph you have access to (same owner); \
-         defaults to the bound graph '{bound_graph}'. Routing is by gateway path, so the \
-         gateway's ACL decides — naming a graph never creates it."
+        "Optional. Route this call to one of your listed graphs instead of the bound graph \
+         '{bound_graph}'. Naming a graph wakes it if it is dormant — a node may be provisioned \
+         and the call may block for up to --activation-timeout (default 300 s) while it becomes \
+         routable. Never creates a graph: the name must already be in list_graphs, and the \
+         gateway's ACL decides. Use either graph_id or graphId, not both."
     );
     let schema = tool
         .as_object_mut()
@@ -967,11 +1347,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn merge_prefixes_only_colliding_control_tools_and_routes_by_name() {
+    fn merge_always_prefixes_control_tools_and_routes_by_name() {
         let cell = json!({ "tools": [
             { "name": "search_documents", "inputSchema": { "type": "object", "properties": {} } },
             { "name": "list_graphs", "inputSchema": { "type": "object" } }
-        ], "nextCursor": "c1" });
+        ]});
         let control = json!({ "tools": [
             { "name": "list_graphs", "inputSchema": { "type": "object" } },
             { "name": "create_graph", "inputSchema": { "type": "object" } }
@@ -985,10 +1365,10 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["search_documents", "list_graphs", "control_list_graphs", "create_graph"]
+            vec!["search_documents", "list_graphs", "control_list_graphs", "control_create_graph"]
         );
-        assert_eq!(merged.collisions, vec!["list_graphs".to_string()]);
-        assert_eq!(merged.result["nextCursor"], json!("c1"));
+        assert!(merged.control_appended);
+        assert!(merged.result.get("nextCursor").is_none());
         assert!(matches!(merged.routes["search_documents"], Route::Cell));
         assert!(matches!(merged.routes["list_graphs"], Route::Cell));
         assert!(matches!(
@@ -996,9 +1376,10 @@ mod tests {
             Route::Control { upstream_name } if upstream_name == "list_graphs"
         ));
         assert!(matches!(
-            &merged.routes["create_graph"],
+            &merged.routes["control_create_graph"],
             Route::Control { upstream_name } if upstream_name == "create_graph"
         ));
+        assert!(!merged.routes.contains_key("create_graph"), "no unprefixed control route");
         // Cell tools gained the routing argument; control tools did not.
         assert_eq!(
             merged.result["tools"][0]["inputSchema"]["properties"]["graph_id"]["type"],
@@ -1012,6 +1393,23 @@ mod tests {
     }
 
     #[test]
+    fn merge_with_a_cursor_defers_control_tools_but_still_routes_them() {
+        let cell = json!({ "tools": [ { "name": "a" } ], "nextCursor": "c1" });
+        let control = json!({ "tools": [ { "name": "list_graphs" } ] });
+        let merged = merge_catalogs(&cell, &control, "notes");
+        let names: Vec<&str> = merged.result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["a"]);
+        assert!(!merged.control_appended);
+        assert_eq!(merged.result["nextCursor"], json!("c1"));
+        assert!(matches!(&merged.routes["control_list_graphs"], Route::Control { .. }));
+    }
+
+    #[test]
     fn graph_argument_does_not_overwrite_an_existing_schema_entry() {
         let mut tool = json!({ "name": "t", "inputSchema": { "type": "object",
             "properties": { "graph_id": { "type": "string", "description": "garden's own" } } } });
@@ -1020,23 +1418,55 @@ mod tests {
             tool["inputSchema"]["properties"]["graph_id"]["description"],
             json!("garden's own")
         );
-        assert!(tool["inputSchema"]["properties"]["graphId"].is_object());
+        let added = tool["inputSchema"]["properties"]["graphId"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(added.contains("wakes it if it is dormant"), "{added}");
+        assert!(added.contains("--activation-timeout"), "{added}");
+        assert!(added.contains("Never creates"), "{added}");
     }
 
     #[test]
-    fn requested_graph_reads_both_spellings_and_ignores_blank_or_non_string() {
+    fn requested_graph_reads_both_spellings_and_ignores_blank_or_null() {
         assert_eq!(
-            requested_graph(Some(&json!({ "graph_id": "a" }))),
+            requested_graph(Some(&json!({ "graph_id": "a" }))).unwrap(),
             Some("a".into())
         );
         assert_eq!(
-            requested_graph(Some(&json!({ "graphId": " b " }))),
+            requested_graph(Some(&json!({ "graphId": " b " }))).unwrap(),
             Some("b".into())
         );
-        assert_eq!(requested_graph(Some(&json!({ "graph_id": "" }))), None);
-        assert_eq!(requested_graph(Some(&json!({ "graph_id": 7 }))), None);
-        assert_eq!(requested_graph(Some(&json!({ "graph_id": null }))), None);
-        assert_eq!(requested_graph(None), None);
+        assert_eq!(requested_graph(Some(&json!({ "graph_id": "" }))).unwrap(), None);
+        assert_eq!(requested_graph(Some(&json!({ "graph_id": null }))).unwrap(), None);
+        assert_eq!(requested_graph(None).unwrap(), None);
+        assert_eq!(
+            requested_graph(Some(&json!({ "graph_id": "a", "graphId": "a" }))).unwrap(),
+            Some("a".into())
+        );
+    }
+
+    #[test]
+    fn requested_graph_refuses_disagreement_and_non_strings() {
+        let err = requested_graph(Some(&json!({ "graph_id": "notes", "graphId": "scratch" })))
+            .unwrap_err();
+        assert!(format!("{err}").contains("disagree"), "{err}");
+        let err = requested_graph(Some(&json!({ "graph_id": 7 }))).unwrap_err();
+        assert!(format!("{err}").contains("must be a string"), "{err}");
+    }
+
+    #[test]
+    fn normalize_leaves_exactly_one_argument_equal_to_the_path() {
+        let mut p = json!({ "name": "t", "arguments": { "graph_id": "x", "graphId": "x", "q": 1 } });
+        normalize_graph_arguments(&mut p, "x");
+        assert_eq!(p["arguments"], json!({ "graph_id": "x", "q": 1 }));
+
+        let mut p = json!({ "name": "t", "arguments": { "graphId": "" } });
+        normalize_graph_arguments(&mut p, "bound");
+        assert_eq!(p["arguments"], json!({ "graphId": "bound" }));
+
+        let mut p = json!({ "name": "t", "arguments": { "q": 1 } });
+        normalize_graph_arguments(&mut p, "bound");
+        assert_eq!(p["arguments"], json!({ "q": 1 }));
     }
 
     #[test]

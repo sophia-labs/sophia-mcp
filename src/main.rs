@@ -64,6 +64,7 @@ async fn build_backend(cli: &Cli) -> anyhow::Result<Arc<dyn Backend>> {
         let opts = GatewayOptions {
             activation_timeout: Duration::from_secs(cli.activation_timeout),
             activation_poll: Duration::from_secs(cli.activation_poll.max(1)),
+            request_timeout: Duration::from_secs(cli.request_timeout.max(1)),
             unified_mcp_fallback: cli.unified_mcp_fallback,
         };
         let gateway = Arc::new(
