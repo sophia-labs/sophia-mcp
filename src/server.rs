@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::backend::Backend;
+use crate::backend::{Backend, ToolNotFound};
 use crate::mcp::{self, method, JsonRpcRequest, JsonRpcResponse};
 
 pub async fn serve_stdio(backend: Arc<dyn Backend>) -> anyhow::Result<()> {
@@ -82,8 +82,19 @@ async fn handle_request(backend: &dyn Backend, req: JsonRpcRequest) -> Option<Js
 
     Some(match result {
         Ok(value) => JsonRpcResponse::success(id, value),
-        Err(e) => JsonRpcResponse::error(id, mcp::BACKEND_ERROR, format!("{e:#}")),
+        Err(e) => JsonRpcResponse::error(id, error_code(&e), format!("{e:#}")),
     })
+}
+
+/// Unknown tool → `METHOD_NOT_FOUND` (the message names the tool); anything
+/// else the backend raised (transport, upstream HTTP, activation timeout) →
+/// `BACKEND_ERROR` with the full error chain as the message.
+fn error_code(e: &anyhow::Error) -> i64 {
+    if e.downcast_ref::<ToolNotFound>().is_some() {
+        mcp::METHOD_NOT_FOUND
+    } else {
+        mcp::BACKEND_ERROR
+    }
 }
 
 /// Ensure the `initialize` result we hand the agent advertises a protocol
@@ -122,6 +133,12 @@ mod tests {
             Ok(json!({ "tools": [ { "name": "search_documents" } ] }))
         }
         async fn call_tool(&self, p: Value) -> anyhow::Result<Value> {
+            if p["name"] == json!("no_such_tool") {
+                return Err(ToolNotFound("no_such_tool".into()).into());
+            }
+            if p["name"] == json!("explodes") {
+                return Err(anyhow::anyhow!("upstream HTTP 502"));
+            }
             Ok(json!({ "content": [], "structuredContent": p }))
         }
     }
@@ -174,6 +191,40 @@ mod tests {
     async fn notifications_get_no_reply() {
         let resp = handle_request(&Echo, req(None, method::INITIALIZED, json!({}))).await;
         assert!(resp.is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_is_method_not_found_naming_the_tool() {
+        let resp = handle_request(
+            &Echo,
+            req(
+                Some(json!(5)),
+                method::TOOLS_CALL,
+                json!({ "name": "no_such_tool", "arguments": {} }),
+            ),
+        )
+        .await
+        .unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, mcp::METHOD_NOT_FOUND);
+        assert!(err.message.contains("no_such_tool"), "got: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn other_backend_failures_stay_backend_errors() {
+        let resp = handle_request(
+            &Echo,
+            req(
+                Some(json!(6)),
+                method::TOOLS_CALL,
+                json!({ "name": "explodes", "arguments": {} }),
+            ),
+        )
+        .await
+        .unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, mcp::BACKEND_ERROR);
+        assert!(err.message.contains("502"), "got: {}", err.message);
     }
 
     #[tokio::test]
