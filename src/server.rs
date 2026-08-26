@@ -6,7 +6,8 @@
 //! get no reply. All logging goes to stderr — stdout is the MCP channel and must
 //! stay clean.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -45,8 +46,13 @@ pub async fn serve_stdio(backend: Arc<dyn Backend>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Dispatch one JSON-RPC request to the backend and shape the reply for the
+/// agent. This is the single client-facing choke point every backend's result
+/// passes through: `initialize` is reconciled, `tools/call` results are
+/// normalized ([`normalize_tool_result`]), everything else is verbatim.
+///
 /// Returns `Some(response)` for requests, `None` for notifications.
-async fn handle_request(backend: &dyn Backend, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
+pub async fn handle_request(backend: &dyn Backend, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
     let id = req.id.clone();
     let is_notification = id.is_none();
 
@@ -58,7 +64,13 @@ async fn handle_request(backend: &dyn Backend, req: JsonRpcRequest) -> Option<Js
 
         method::TOOLS_LIST => backend.list_tools(req.params.clone()).await,
 
-        method::TOOLS_CALL => backend.call_tool(req.params.clone()).await,
+        method::TOOLS_CALL => {
+            let tool = req.params["name"].as_str().unwrap_or("<unnamed>").to_owned();
+            backend
+                .call_tool(req.params.clone())
+                .await
+                .map(|result| normalize_tool_result(&tool, result))
+        }
 
         // Liveness ping handled locally.
         method::PING => Ok(json!({})),
@@ -116,6 +128,56 @@ fn reconcile_initialize(mut backend_result: Value) -> Value {
     backend_result
 }
 
+/// Client-facing normalization of a `tools/call` result envelope.
+///
+/// MCP specifies `structuredContent` as a JSON **object**; strict clients
+/// (Claude Code's included) reject anything else — "structuredContent expected
+/// record, received array". Some upstreams break this: the platform-next
+/// gateway's control plane answers `list_graphs` with a bare array. Rather than
+/// let one upstream's shape fail the whole call at the agent, sophia-mcp
+/// reshapes the envelope at the stdio edge, for every backend alike:
+///
+/// * array → `{ "items": [...] }`
+/// * any other non-object (string, number, bool, null) → `{ "value": ... }`
+/// * object → untouched; absent → untouched
+///
+/// `content` (and every other envelope field) is never modified. Logged at
+/// `debug` on stderr once per tool name so the upstream defect stays visible
+/// without flooding the log.
+pub fn normalize_tool_result(tool: &str, mut result: Value) -> Value {
+    let Some(envelope) = result.as_object_mut() else {
+        return result;
+    };
+    let Some(structured) = envelope.get_mut("structuredContent") else {
+        return result;
+    };
+    let wrapped_as = match structured {
+        Value::Object(_) => return result,
+        Value::Array(_) => "items",
+        _ => "value",
+    };
+    let inner = structured.take();
+    *structured = json!({ wrapped_as: inner });
+    log_normalization_once(tool, wrapped_as);
+    result
+}
+
+fn log_normalization_once(tool: &str, wrapped_as: &str) {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let first = seen
+        .lock()
+        .map(|mut set| set.insert(tool.to_owned()))
+        .unwrap_or(true);
+    if first {
+        tracing::debug!(
+            tool,
+            wrapped_as,
+            "upstream returned a non-object structuredContent; wrapped for the MCP client"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +200,10 @@ mod tests {
             }
             if p["name"] == json!("explodes") {
                 return Err(anyhow::anyhow!("upstream HTTP 502"));
+            }
+            if p["name"] == json!("lists_an_array") {
+                return Ok(json!({ "content": [{ "type": "text", "text": "two rows" }],
+                    "structuredContent": [{ "graphId": "a" }, { "graphId": "b" }] }));
             }
             Ok(json!({ "content": [], "structuredContent": p }))
         }
@@ -233,5 +299,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.error.unwrap().code, mcp::METHOD_NOT_FOUND);
+    }
+
+    // ------------------------------------------------ structuredContent shape
+
+    #[test]
+    fn normalizer_wraps_an_array_as_items_and_leaves_content_alone() {
+        let out = normalize_tool_result(
+            "control_list_graphs",
+            json!({ "content": [{ "type": "text", "text": "t" }], "structuredContent": [1, 2] }),
+        );
+        assert_eq!(out["structuredContent"], json!({ "items": [1, 2] }));
+        assert_eq!(out["content"], json!([{ "type": "text", "text": "t" }]));
+    }
+
+    #[test]
+    fn normalizer_wraps_scalars_as_value() {
+        for scalar in [json!("s"), json!(3), json!(true), Value::Null] {
+            let out = normalize_tool_result("t", json!({ "content": [], "structuredContent": scalar }));
+            assert_eq!(out["structuredContent"], json!({ "value": scalar }), "scalar {scalar}");
+        }
+    }
+
+    #[test]
+    fn normalizer_leaves_objects_untouched() {
+        let envelope = json!({ "content": [], "structuredContent": { "items": [1], "x": 2 }, "isError": false });
+        assert_eq!(normalize_tool_result("t", envelope.clone()), envelope);
+    }
+
+    #[test]
+    fn normalizer_leaves_absent_structured_content_and_non_object_envelopes_untouched() {
+        let without = json!({ "content": [{ "type": "text", "text": "plain" }] });
+        assert_eq!(normalize_tool_result("t", without.clone()), without);
+        assert_eq!(normalize_tool_result("t", json!([1, 2])), json!([1, 2]));
+    }
+
+    #[tokio::test]
+    async fn tools_call_array_structured_content_reaches_the_client_as_items() {
+        let resp = handle_request(
+            &Echo,
+            req(
+                Some(json!(7)),
+                method::TOOLS_CALL,
+                json!({ "name": "lists_an_array", "arguments": {} }),
+            ),
+        )
+        .await
+        .unwrap();
+        let result = resp.result.unwrap();
+        assert_eq!(
+            result["structuredContent"],
+            json!({ "items": [{ "graphId": "a" }, { "graphId": "b" }] })
+        );
+        assert_eq!(result["content"][0]["text"], json!("two rows"));
     }
 }

@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sophia_mcp::backend::{AuthHeaders, Backend, GatewayBackend, GatewayOptions, ToolNotFound};
+use sophia_mcp::mcp::{method as rpc, JsonRpcRequest};
+use sophia_mcp::server::handle_request;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -184,6 +186,21 @@ async fn connect(server: &MockServer, graph: &str) -> GatewayBackend {
     GatewayBackend::connect(&server.uri(), OWNER, graph, auth(), fast())
         .await
         .unwrap()
+}
+
+/// Drive a `tools/call` through the stdio dispatch (`server::handle_request`)
+/// — the exact function whose output is serialized to the MCP client — and
+/// return the JSON-RPC `result`.
+async fn client_calls(gw: &GatewayBackend, name: &str, arguments: Value) -> Value {
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: rpc::TOOLS_CALL.into(),
+        params: json!({ "name": name, "arguments": arguments }),
+    };
+    let resp = handle_request(gw, req).await.expect("a request gets a reply");
+    assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+    resp.result.unwrap()
 }
 
 // ------------------------------------------------------------------ connect
@@ -1244,4 +1261,56 @@ async fn repair_required_503_on_the_cell_path_is_one_request_and_an_immediate_er
     assert!(!msg.contains("is not routable after"), "must not be a budget timeout: {msg}");
     assert_eq!(requests_to(&server, "/g/notes/mcp").await, 1);
     server.verify().await;
+}
+
+// ------------------------------------------- structuredContent at the client
+
+/// The gateway's control plane answers `list_graphs` with a bare JSON array in
+/// `structuredContent`; the MCP spec (and Claude Code's client) require an
+/// object. The backend passes the upstream envelope through verbatim; the
+/// stdio edge wraps it as `{ "items": [...] }` so the client accepts the call.
+#[tokio::test]
+async fn control_tool_array_structured_content_reaches_the_client_as_items() {
+    let server = MockServer::start().await;
+    mount_control(&server, "/control/mcp", &["notes", "scratch"]).await;
+    mount_warm_cell(&server, "notes").await;
+
+    let gw = connect(&server, "notes").await;
+    let rows = json!([row(OWNER, "notes", "active"), row(OWNER, "scratch", "active")]);
+
+    // Backend level: verbatim (the array is what the gateway sent).
+    let raw = gw
+        .call_tool(json!({ "name": "control_list_graphs", "arguments": {} }))
+        .await
+        .unwrap();
+    assert_eq!(raw["structuredContent"], rows);
+
+    // Client level: an object, with the array intact under `items`; `content`
+    // is exactly what the gateway sent.
+    let seen = client_calls(&gw, "control_list_graphs", json!({})).await;
+    assert_eq!(seen["structuredContent"], json!({ "items": rows }), "got: {seen}");
+    assert!(seen["structuredContent"].is_object());
+    assert_eq!(seen["content"], json!([]));
+}
+
+/// A cell tool that already answers with an object is not touched on the way
+/// to the client — no `items` wrapping, no key added, nothing dropped.
+#[tokio::test]
+async fn cell_tool_object_structured_content_is_unchanged_at_the_client() {
+    let server = MockServer::start().await;
+    mount_control(&server, "/control/mcp", &["notes"]).await;
+    mount_warm_cell(&server, "notes").await;
+
+    let gw = connect(&server, "notes").await;
+    let raw = gw
+        .call_tool(json!({ "name": "search_documents", "arguments": { "query": "q" } }))
+        .await
+        .unwrap();
+    let seen = client_calls(&gw, "search_documents", json!({ "query": "q" })).await;
+    assert_eq!(seen, raw, "client envelope must equal the upstream envelope");
+    assert_eq!(
+        seen["structuredContent"],
+        json!({ "cell": "notes", "owner_path": OWNER_PATH })
+    );
+    assert!(seen["structuredContent"].get("items").is_none());
 }

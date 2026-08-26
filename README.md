@@ -296,6 +296,7 @@ Claude Code ──stdio JSON-RPC──▶ sophia-mcp ──HTTP JSON-RPC──�
 * **Tools:** never hardcoded. `tools/list` returns the backend's catalog (for a
   gateway: cell ∪ control, see *Multi-graph*); `tools/call` forwards
   `{name, arguments}` and returns the result envelope.
+* **`structuredContent` is always an object at the client:** MCP requires it, and Claude Code rejects anything else; when an upstream answers with an array (the gateway control plane's `list_graphs` does) sophia-mcp wraps it as `{"items": [...]}` (a scalar as `{"value": …}`), leaving objects and `content` untouched — logged at `debug` once per tool.
 
 ### Layout
 
@@ -325,9 +326,10 @@ tests/
 cargo test
 ```
 
-51 tests: URL resolution, auth-header construction, catalog merging (prefixing,
+61 tests: URL resolution, auth-header construction, catalog merging (prefixing,
 pagination), graph-argument parsing/normalization, the stdio dispatch (initialize
-backfill, tools passthrough, notification handling, unknown method / unknown tool),
+backfill, tools passthrough, `structuredContent` normalization, notification handling,
+unknown method / unknown tool),
 a wiremock-backed end-to-end of the direct remote proxy, and a wiremock gateway
 covering the union catalog, `graph_id` routing (listed, unlisted, revoked-on-refresh,
 tombstoned, shared-by-another-owner, ambiguous, disagreeing spellings, 403, 404),
