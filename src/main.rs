@@ -10,7 +10,8 @@ use anyhow::Context;
 use clap::Parser;
 
 use sophia_mcp::backend::{
-    self, AuthHeaders, Backend, GatewayBackend, GatewayOptions, LocalGarden, RemoteHttp,
+    self, AuthHeaders, Backend, ComposedBackend, GatewayBackend, GatewayOptions, LocalGarden,
+    RemoteHttp,
 };
 use sophia_mcp::config::Cli;
 use sophia_mcp::server;
@@ -27,7 +28,17 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let backend = build_backend(&cli).await?;
+    let sub_specs = cli
+        .resolved_subs()
+        .context("parsing --sub / --sub-token")?;
+    let mut backend = build_backend(&cli).await?;
+    if !sub_specs.is_empty() {
+        let prefixes: Vec<&str> = sub_specs.iter().map(|s| s.prefix.as_str()).collect();
+        tracing::info!(subs = ?prefixes, "composing sub-MCPs above the primary backend");
+        let composed = ComposedBackend::compose(backend, sub_specs).await?;
+        tracing::info!(subs = ?composed.sub_prefixes(), "sub-MCPs composed (see above for which are up)");
+        backend = Arc::new(composed);
+    }
 
     tracing::info!("sophia-mcp proxy ready; serving MCP over stdio");
     server::serve_stdio(backend).await?;

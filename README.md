@@ -158,6 +158,40 @@ argument, equal to the routed path. (`graph_id` as a bare tool argument was once
 unpoliced second carrier that made cells auto-create graphs; routing it through the
 gateway path and normalizing the body closes that.)
 
+### Sub-MCPs
+
+sophia-mcp can mount **additional, independently-owned MCP servers** above whichever
+backend you've chosen (LOCAL, direct remote `/mcp`, or a gateway) — no change to
+that backend required. A sub is any HTTP server speaking the same
+"streamable-http-json" wire (POST JSON-RPC 2.0 to one URL: `tools/list`,
+`tools/call`) that `RemoteHttp` already speaks to a cell.
+
+```bash
+sophia-mcp --backend local --sub layout=http://127.0.0.1:5199/mcp
+```
+
+* **Naming.** A sub reports **bare** tool names (`world`, `moves`, …); sophia-mcp
+  exposes them to the agent as `<prefix>_<name>` (`layout_world`, `layout_moves`),
+  descriptions and schemas passed through verbatim. A `tools/call` whose name
+  starts with `<prefix>_` routes to that sub with the bare name, arguments
+  untouched. This generalizes the `control_` merge `GatewayBackend` already does
+  for the gateway's own control plane (see *Multi-graph* above) to any number of
+  independently-owned upstreams — it does not change that merge, and a
+  `ComposedBackend` may itself wrap a `GatewayBackend`.
+* **Config.** `--sub <prefix>=<url>` (repeatable; env `SOPHIA_MCP_SUBS` as a
+  comma-separated list of the same `prefix=url` pairs) and `--sub-token
+  <prefix>=<token>` (repeatable; env `SOPHIA_MCP_SUB_TOKENS`) for a per-sub
+  bearer, sent only on that sub's requests — never on the primary backend's, and
+  never on another sub's. `prefix` must match `[a-z][a-z0-9]*` (refused at config
+  parse otherwise, e.g. `Layout=`, `1x=`).
+* **Resilience.** Each sub is probed with one `tools/list` call when sophia-mcp
+  starts. A sub that fails that probe is logged to stderr (prefix + error —
+  never the token) and **skipped** for the rest of the process's life: the
+  primary's own catalog still serves, and `tools/call` to `<prefix>_<name>` for a
+  skipped sub is a JSON-RPC `-32601` naming the tool, without ever touching the
+  network. A sub error during a live `tools/call` surfaces as `BACKEND_ERROR` with
+  the chain, exactly like the primary's own upstream failures.
+
 ### Waiting for a routable cell
 
 A cloud-2 cell can be *boot-ready but not routable* (a running pod that does not
@@ -221,6 +255,8 @@ Every flag has an env var twin.
 | `--garden-bin` | `SOPHIA_MCP_GARDEN_BIN` | auto-discover | LOCAL `gardend` path |
 | `--local-port` | `SOPHIA_MCP_LOCAL_PORT` | `0` (OS-assigned) | LOCAL loopback port |
 | `--local-health-timeout` | `SOPHIA_MCP_LOCAL_HEALTH_TIMEOUT` | `30` | seconds to wait for `/health` |
+| `--sub` | `SOPHIA_MCP_SUBS` | — | mount a sub-MCP, `<prefix>=<url>` (repeatable; env is comma-separated) |
+| `--sub-token` | `SOPHIA_MCP_SUB_TOKENS` | — | bearer for one sub, `<prefix>=<token>` (repeatable; env is comma-separated) |
 
 Logging goes to **stderr** (stdout is the MCP channel). Set `SOPHIA_MCP_LOG=debug` for
 verbose output.
@@ -313,9 +349,11 @@ src/
                        wait-for-routable across activation
     local.rs           LocalGarden — spawn gardend, wait /health, reuse RemoteHttp
     local_lib.rs       experimental in-process variant (feature `local-garden-lib`)
+    composed.rs        ComposedBackend — mounts namespaced `--sub` MCPs above any backend
 tests/
   remote_proxy.rs      end-to-end RemoteHttp against a mock /mcp
   gateway_multigraph.rs  end-to-end GatewayBackend against a mock gateway
+  composed_subs.rs     end-to-end ComposedBackend against mock primary + sub servers
 ```
 
 ---
@@ -326,17 +364,21 @@ tests/
 cargo test
 ```
 
-61 tests: URL resolution, auth-header construction, catalog merging (prefixing,
-pagination), graph-argument parsing/normalization, the stdio dispatch (initialize
-backfill, tools passthrough, `structuredContent` normalization, notification handling,
-unknown method / unknown tool),
-a wiremock-backed end-to-end of the direct remote proxy, and a wiremock gateway
+72 tests: URL resolution, auth-header construction, catalog merging (prefixing,
+pagination), graph-argument parsing/normalization, sub-MCP prefix parsing/validation,
+the stdio dispatch (initialize backfill, tools passthrough, `structuredContent`
+normalization, notification handling, unknown method / unknown tool),
+a wiremock-backed end-to-end of the direct remote proxy, a wiremock gateway
 covering the union catalog, `graph_id` routing (listed, unlisted, revoked-on-refresh,
 tombstoned, shared-by-another-owner, ambiguous, disagreeing spellings, 403, 404),
 activation waiting (flip-after-N, 503-forever with backoff, hung upstream, queued
 waiter, `failed`, repair-required at connect and on the cell path, off-origin
 pollUrl, transient 503 at kick, health-200-is-not-readiness) and mid-session
-re-activation.
+re-activation, and a wiremock `ComposedBackend` covering the merged catalog
+(descriptions verbatim), `<prefix>_<name>` routing through the real stdio dispatch,
+a non-prefixed call still reaching the primary, a sub whose `tools/list` 500s at
+start being skipped (`layout_x` → `-32601`, no network touched), and per-sub
+bearer tokens never crossing to the primary or another sub.
 
 ---
 

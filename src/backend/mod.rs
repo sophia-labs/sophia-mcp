@@ -13,6 +13,13 @@
 //!     wait-for-routable across cell activation.
 //!
 //! All speak the identical MCP wire shape toward the agent.
+//!
+//! [`ComposedBackend`] wraps any of the above (`--sub <prefix>=<url>`,
+//! repeatable) with additional namespaced sub-MCPs — independent HTTP MCP
+//! servers whose tools are merged into the catalog under `<prefix>_<name>`.
+//! It is a generalization of the `control_` merge `GatewayBackend` already
+//! does for exactly one upstream; composition applies above any backend
+//! without changing it.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -25,6 +32,9 @@ pub use gateway::{GatewayBackend, GatewayOptions};
 
 pub mod local;
 pub use local::LocalGarden;
+
+pub mod composed;
+pub use composed::ComposedBackend;
 
 #[cfg(feature = "local-garden-lib")]
 pub mod local_lib;

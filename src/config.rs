@@ -101,6 +101,26 @@ pub struct Cli {
     /// Seconds to wait for the LOCAL garden `/health` before giving up.
     #[arg(long, default_value_t = 30, env = "SOPHIA_MCP_LOCAL_HEALTH_TIMEOUT")]
     pub local_health_timeout: u64,
+
+    // ---- Sub-MCPs (composed above ANY backend: local, remote, or gateway) ----
+    /// Mount a namespaced sub-MCP: `<prefix>=<url>`, e.g. `layout=http://127.0.0.1:5199/mcp`.
+    /// Repeatable. Its bare tool names (`world`, `moves`, …) are exposed to the
+    /// agent as `<prefix>_<name>` (`layout_world`); a `tools/call` whose name
+    /// starts with `<prefix>_` routes there, bare name, arguments untouched. A
+    /// sub that fails its one `tools/list` probe at start is skipped (logged to
+    /// stderr, never the token) — the rest of the catalog still serves. `prefix`
+    /// must match `[a-z][a-z0-9]*`. Env `SOPHIA_MCP_SUBS` is a comma-separated
+    /// list of the same `prefix=url` pairs.
+    #[arg(long = "sub", env = "SOPHIA_MCP_SUBS", value_delimiter = ',')]
+    pub subs: Vec<String>,
+
+    /// Bearer token for one sub-MCP: `<prefix>=<token>`. Repeatable. Sent only
+    /// on requests to that sub — never to the primary backend or any other sub.
+    /// A prefix with no matching `--sub` is harmless (unused). Env
+    /// `SOPHIA_MCP_SUB_TOKENS` is a comma-separated list of the same
+    /// `prefix=token` pairs.
+    #[arg(long = "sub-token", env = "SOPHIA_MCP_SUB_TOKENS", value_delimiter = ',')]
+    pub sub_tokens: Vec<String>,
 }
 
 impl Cli {
@@ -118,5 +138,139 @@ impl Cli {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         home.join(".sophia-mcp").join("profile")
+    }
+
+    /// Parse + validate `--sub` / `--sub-token` into [`SubSpec`]s. Empty when
+    /// no `--sub` was given — the common case, where `ComposedBackend` is
+    /// never built at all.
+    pub fn resolved_subs(&self) -> anyhow::Result<Vec<SubSpec>> {
+        parse_sub_specs(&self.subs, &self.sub_tokens)
+    }
+}
+
+/// One configured sub-MCP, resolved from `--sub <prefix>=<url>` plus its
+/// optional `--sub-token <prefix>=<token>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubSpec {
+    pub prefix: String,
+    pub url: String,
+    pub token: Option<String>,
+}
+
+/// A bare, single-segment lowercase identifier: `[a-z][a-z0-9]*`. Refuses an
+/// empty string, an uppercase letter anywhere (`Layout`), a leading digit
+/// (`1x`), and any separator (`-`, `_`, `.`, whitespace).
+fn valid_prefix(p: &str) -> bool {
+    let mut chars = p.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// Parse the raw `--sub` / `--sub-token` strings (already split on `,` by
+/// clap's `value_delimiter`, one `prefix=value` pair per element) into
+/// validated [`SubSpec`]s. Refuses: a malformed pair (no `=`), an invalid or
+/// duplicate prefix, and an empty url. A `--sub-token` prefix with no
+/// matching `--sub` is silently unused, not an error.
+pub fn parse_sub_specs(subs: &[String], sub_tokens: &[String]) -> anyhow::Result<Vec<SubSpec>> {
+    let mut tokens: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for raw in sub_tokens {
+        let (prefix, token) = raw
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--sub-token '{raw}' must be prefix=token"))?;
+        if !valid_prefix(prefix) {
+            anyhow::bail!(
+                "--sub-token prefix '{prefix}' is invalid: must match [a-z][a-z0-9]*"
+            );
+        }
+        if tokens.insert(prefix, token).is_some() {
+            anyhow::bail!("--sub-token prefix '{prefix}' given more than once");
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut specs = Vec::with_capacity(subs.len());
+    for raw in subs {
+        let (prefix, url) = raw
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--sub '{raw}' must be prefix=url"))?;
+        if !valid_prefix(prefix) {
+            anyhow::bail!(
+                "--sub prefix '{prefix}' is invalid: must match [a-z][a-z0-9]* (got '{prefix}')"
+            );
+        }
+        if url.trim().is_empty() {
+            anyhow::bail!("--sub '{raw}' has an empty url");
+        }
+        if !seen.insert(prefix) {
+            anyhow::bail!("--sub prefix '{prefix}' given more than once");
+        }
+        specs.push(SubSpec {
+            prefix: prefix.to_string(),
+            url: url.to_string(),
+            token: tokens.get(prefix).map(|t| t.to_string()),
+        });
+    }
+    Ok(specs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_subs_and_pairs_matching_tokens() {
+        let specs = parse_sub_specs(
+            &["layout=http://127.0.0.1:5199/mcp".into(), "obs2=http://x/mcp".into()],
+            &["layout=secret-token".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            specs,
+            vec![
+                SubSpec {
+                    prefix: "layout".into(),
+                    url: "http://127.0.0.1:5199/mcp".into(),
+                    token: Some("secret-token".into()),
+                },
+                SubSpec {
+                    prefix: "obs2".into(),
+                    url: "http://x/mcp".into(),
+                    token: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_uppercase_and_leading_digit_prefixes() {
+        for bad in ["Layout=http://x", "1x=http://x", "-x=http://x", "=http://x"] {
+            let err = parse_sub_specs(&[bad.to_string()], &[]).unwrap_err();
+            assert!(format!("{err}").contains("invalid"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_pair_empty_url_and_duplicate_prefix() {
+        assert!(parse_sub_specs(&["no-equals-sign".into()], &[]).is_err());
+        assert!(parse_sub_specs(&["layout=".into()], &[]).is_err());
+        assert!(parse_sub_specs(
+            &["layout=http://a".into(), "layout=http://b".into()],
+            &[]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_unmatched_sub_token_prefix_is_not_an_error() {
+        let specs = parse_sub_specs(&[], &["ghost=token".into()]).unwrap();
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn no_subs_is_the_empty_vec() {
+        assert_eq!(parse_sub_specs(&[], &[]).unwrap(), vec![]);
     }
 }
