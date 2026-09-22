@@ -5,7 +5,11 @@ edition = "2021"
 rust-version = "1.85"
 description = "Stdio MCP server that proxies Claude Code (and other MCP clients) to a Mnemosyne/garden backend. Tools are autopopulated from the backend, never hardcoded."
 license = "MIT OR Apache-2.0"
+authors = ["Veronica Chambers"]
 repository = "https://github.com/sophia-labs/sophia-mcp"
+readme = "README.md"
+keywords = ["mcp", "claude", "proxy", "knowledge-graph"]
+categories = ["command-line-utilities", "network-programming"]
 default-run = "sophia-mcp"
 
 [lib]
