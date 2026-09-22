@@ -65,7 +65,10 @@ pub async fn handle_request(backend: &dyn Backend, req: JsonRpcRequest) -> Optio
         method::TOOLS_LIST => backend.list_tools(req.params.clone()).await,
 
         method::TOOLS_CALL => {
-            let tool = req.params["name"].as_str().unwrap_or("<unnamed>").to_owned();
+            let tool = req.params["name"]
+                .as_str()
+                .unwrap_or("<unnamed>")
+                .to_owned();
             backend
                 .call_tool(req.params.clone())
                 .await
@@ -94,8 +97,42 @@ pub async fn handle_request(backend: &dyn Backend, req: JsonRpcRequest) -> Optio
 
     Some(match result {
         Ok(value) => JsonRpcResponse::success(id, value),
-        Err(e) => JsonRpcResponse::error(id, error_code(&e), format!("{e:#}")),
+        Err(e) => {
+            // Full, unredacted chain to stderr for operators — the MCP
+            // CLIENT only ever sees the bounded rendering below.
+            tracing::error!(error = %format!("{e:#}"), "backend call failed");
+            JsonRpcResponse::error(id, error_code(&e), redact_error_message(&e))
+        }
     })
+}
+
+/// Cap on the rendered error chain handed to the MCP CLIENT. Independent of,
+/// and smaller than the sum of, any per-site upstream-body redaction further
+/// down the stack (`backend::remote::redact_body`) — this is the backstop:
+/// even a chain built from several already-bounded pieces (nested `anyhow`
+/// `.context()` layers) can't grow past a sane size here, and anything that
+/// somehow reached this point without going through a redaction site still
+/// gets capped rather than shipped whole to an untrusted-by-default client.
+const CLIENT_ERROR_MAX_BYTES: usize = 2048;
+
+/// Render an error for the MCP CLIENT: the full `anyhow` chain (`{:#}`),
+/// capped at [`CLIENT_ERROR_MAX_BYTES`]. Full, unredacted detail always goes
+/// to stderr first (see the `tracing::error!` call above this function's one
+/// call site) — this function's return value is the ONLY thing the client
+/// ever sees for a failed call.
+fn redact_error_message(e: &anyhow::Error) -> String {
+    let full = format!("{e:#}");
+    if full.len() <= CLIENT_ERROR_MAX_BYTES {
+        return full;
+    }
+    let mut end = CLIENT_ERROR_MAX_BYTES;
+    while end > 0 && !full.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}… [truncated to {CLIENT_ERROR_MAX_BYTES} bytes; full detail in server logs]",
+        &full[..end]
+    )
 }
 
 /// Unknown tool → `METHOD_NOT_FOUND` (the message names the tool); anything
@@ -201,6 +238,18 @@ mod tests {
             if p["name"] == json!("explodes") {
                 return Err(anyhow::anyhow!("upstream HTTP 502"));
             }
+            if p["name"] == json!("explodes_huge") {
+                // Simulates an upstream body that reached this point
+                // un-redacted (e.g. a future call site that forgets
+                // `backend::remote::redact_body`) — proves the server.rs
+                // choke point is a real backstop, not just decoration on
+                // top of the per-site redaction already covered elsewhere.
+                let secret = "SECRET_TOKEN_MUST_NOT_LEAK";
+                return Err(anyhow::anyhow!(
+                    "backend returned HTTP 500: {}{secret}",
+                    "x".repeat(5000)
+                ));
+            }
             if p["name"] == json!("lists_an_array") {
                 return Ok(json!({ "content": [{ "type": "text", "text": "two rows" }],
                     "structuredContent": [{ "graphId": "a" }, { "graphId": "b" }] }));
@@ -301,6 +350,73 @@ mod tests {
         assert_eq!(resp.error.unwrap().code, mcp::METHOD_NOT_FOUND);
     }
 
+    // --------------------------------------- client-facing error redaction
+
+    #[tokio::test]
+    async fn a_huge_secret_bearing_backend_error_reaches_the_client_bounded_and_without_the_secret()
+    {
+        let resp = handle_request(
+            &Echo,
+            req(
+                Some(json!(8)),
+                method::TOOLS_CALL,
+                json!({ "name": "explodes_huge", "arguments": {} }),
+            ),
+        )
+        .await
+        .unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, mcp::BACKEND_ERROR);
+        assert!(
+            err.message.len() <= CLIENT_ERROR_MAX_BYTES + 100,
+            "client message must be bounded, got {} bytes",
+            err.message.len()
+        );
+        assert!(
+            !err.message.contains("SECRET_TOKEN_MUST_NOT_LEAK"),
+            "the secret past the cap must never reach the client: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("truncated"),
+            "must carry an explicit truncation marker: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_legitimate_error_reaches_the_client_unmodified() {
+        // Regression guard: the redaction choke point must not mangle or
+        // truncate an ordinary, already-short error — normal UX (a gateway's
+        // legible rejection message, a plain tool failure) is unaffected.
+        let resp = handle_request(
+            &Echo,
+            req(
+                Some(json!(9)),
+                method::TOOLS_CALL,
+                json!({ "name": "explodes", "arguments": {} }),
+            ),
+        )
+        .await
+        .unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.message, "upstream HTTP 502");
+    }
+
+    #[test]
+    fn redact_error_message_passes_a_short_chain_through_unchanged() {
+        let e = anyhow::anyhow!("graph 'notes' is not routable after 1.2s");
+        assert_eq!(redact_error_message(&e), format!("{e:#}"));
+    }
+
+    #[test]
+    fn redact_error_message_truncates_a_huge_chain_with_a_bounded_marker() {
+        let e = anyhow::anyhow!("x".repeat(CLIENT_ERROR_MAX_BYTES * 3));
+        let redacted = redact_error_message(&e);
+        assert!(redacted.len() <= CLIENT_ERROR_MAX_BYTES + 100);
+        assert!(redacted.contains("truncated"));
+    }
+
     // ------------------------------------------------ structuredContent shape
 
     #[test]
@@ -316,8 +432,13 @@ mod tests {
     #[test]
     fn normalizer_wraps_scalars_as_value() {
         for scalar in [json!("s"), json!(3), json!(true), Value::Null] {
-            let out = normalize_tool_result("t", json!({ "content": [], "structuredContent": scalar }));
-            assert_eq!(out["structuredContent"], json!({ "value": scalar }), "scalar {scalar}");
+            let out =
+                normalize_tool_result("t", json!({ "content": [], "structuredContent": scalar }));
+            assert_eq!(
+                out["structuredContent"],
+                json!({ "value": scalar }),
+                "scalar {scalar}"
+            );
         }
     }
 

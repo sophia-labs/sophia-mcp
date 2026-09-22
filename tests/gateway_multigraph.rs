@@ -37,11 +37,13 @@ fn fast() -> GatewayOptions {
         activation_poll: Duration::from_millis(20),
         request_timeout: Duration::from_secs(5),
         unified_mcp_fallback: false,
+        allow_insecure_http: false,
     }
 }
 
 fn rpc_ok(result: Value) -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_json(json!({ "jsonrpc": "2.0", "id": "x", "result": result }))
+    ResponseTemplate::new(200)
+        .set_body_json(json!({ "jsonrpc": "2.0", "id": "x", "result": result }))
 }
 
 fn cell_path_of(owner_path: &str, graph: &str) -> String {
@@ -75,7 +77,9 @@ async fn mount_control_with(server: &MockServer, at: &str, list_graphs: impl Res
         .and(path(at))
         .and(header("authorization", "Bearer service-token"))
         .and(header("x-pn-on-behalf-of", "owner-sub"))
-        .and(body_partial_json(json!({ "method": "tools/call", "params": { "name": "list_graphs" } })))
+        .and(body_partial_json(
+            json!({ "method": "tools/call", "params": { "name": "list_graphs" } }),
+        ))
         .respond_with(list_graphs)
         .mount(server)
         .await;
@@ -107,8 +111,10 @@ async fn mount_warm_cell_of(server: &MockServer, owner_path: &str, graph: &str) 
     Mock::given(method("POST"))
         .and(path(cell_path_of(owner_path, graph)))
         .and(body_partial_json(json!({ "method": "initialize" })))
-        .respond_with(rpc_ok(json!({ "protocolVersion": "2025-03-26", "capabilities": { "tools": {} },
-            "serverInfo": { "name": "gardend", "version": "0.0" } })))
+        .respond_with(rpc_ok(
+            json!({ "protocolVersion": "2025-03-26", "capabilities": { "tools": {} },
+            "serverInfo": { "name": "gardend", "version": "0.0" } }),
+        ))
         .mount(server)
         .await;
     Mock::given(method("POST"))
@@ -198,7 +204,9 @@ async fn client_calls(gw: &GatewayBackend, name: &str, arguments: Value) -> Valu
         method: rpc::TOOLS_CALL.into(),
         params: json!({ "name": name, "arguments": arguments }),
     };
-    let resp = handle_request(gw, req).await.expect("a request gets a reply");
+    let resp = handle_request(gw, req)
+        .await
+        .expect("a request gets a reply");
     assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
     resp.result.unwrap()
 }
@@ -245,7 +253,10 @@ async fn connect_discovers_kicks_activation_and_proves_routability_before_tools(
         .await;
 
     let gw = connect(&server, "notes").await;
-    assert_eq!(gw.mcp_url_for("notes"), format!("{}{}", server.uri(), cell_path("notes")));
+    assert_eq!(
+        gw.mcp_url_for("notes"),
+        format!("{}{}", server.uri(), cell_path("notes"))
+    );
     assert_eq!(gw.control_url(), format!("{}/control/mcp", server.uri()));
     // Nothing on the cell path yet: connect only kicked the activation.
     assert_eq!(requests_to(&server, "/g/notes/mcp").await, 0);
@@ -261,7 +272,14 @@ async fn connect_discovers_kicks_activation_and_proves_routability_before_tools(
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["search_documents", "control_list_graphs", "control_create_graph"]);
+    assert_eq!(
+        names,
+        vec![
+            "search_documents",
+            "control_list_graphs",
+            "control_create_graph"
+        ]
+    );
     server.verify().await;
 }
 
@@ -276,10 +294,16 @@ async fn undiscoverable_tuple_never_activates_or_calls_the_graph_endpoint() {
         Err(error) => error,
     };
     let msg = format!("{error:#}");
-    assert!(msg.contains("not in this identity's list_graphs"), "got: {msg}");
+    assert!(
+        msg.contains("not in this identity's list_graphs"),
+        "got: {msg}"
+    );
     assert!(msg.contains("will not activate or create"), "got: {msg}");
     let requests = server.received_requests().await.unwrap();
-    assert!(requests.iter().all(|r| r.url.path() == "/control/mcp"), "{requests:?}");
+    assert!(
+        requests.iter().all(|r| r.url.path() == "/control/mcp"),
+        "{requests:?}"
+    );
 }
 
 #[tokio::test]
@@ -313,7 +337,9 @@ async fn transient_503_at_the_activation_kick_does_not_kill_connect() {
     Mock::given(method("POST"))
         .and(path(cell_path("notes")))
         .and(body_partial_json(json!({ "method": "tools/call" })))
-        .respond_with(rpc_ok(json!({ "content": [], "structuredContent": { "cell": "notes" } })))
+        .respond_with(rpc_ok(
+            json!({ "content": [], "structuredContent": { "cell": "notes" } }),
+        ))
         .mount(&server)
         .await;
 
@@ -347,7 +373,10 @@ async fn initialize_is_answered_locally_as_sophia_mcp_without_touching_the_cell(
         .await
         .unwrap();
     assert_eq!(init["serverInfo"]["name"], json!("sophia-mcp"));
-    assert_eq!(init["serverInfo"]["version"], json!(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        init["serverInfo"]["version"],
+        json!(env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(init["protocolVersion"], json!("2025-03-26"));
     assert_eq!(requests_to(&server, "/g/notes/mcp").await, 0);
     assert_eq!(requests_to(&server, "/activations/").await, 0);
@@ -358,7 +387,9 @@ async fn unified_mcp_fallback_is_used_only_when_control_404s_and_the_flag_is_set
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/control/mcp"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "error": "not found: route" })))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_json(json!({ "error": "not found: route" })),
+        )
         .mount(&server)
         .await;
     mount_control(&server, "/mcp", &["notes"]).await;
@@ -396,8 +427,12 @@ async fn tools_list_is_the_union_with_control_tools_always_prefixed_and_routed()
     mount_warm_cell(&server, "notes").await;
     Mock::given(method("POST"))
         .and(path("/control/mcp"))
-        .and(body_partial_json(json!({ "method": "tools/call", "params": { "name": "create_graph" } })))
-        .respond_with(rpc_ok(json!({ "content": [], "structuredContent": { "control": "create_graph" } })))
+        .and(body_partial_json(
+            json!({ "method": "tools/call", "params": { "name": "create_graph" } }),
+        ))
+        .respond_with(rpc_ok(
+            json!({ "content": [], "structuredContent": { "control": "create_graph" } }),
+        ))
         .expect(1)
         .mount(&server)
         .await;
@@ -412,17 +447,36 @@ async fn tools_list_is_the_union_with_control_tools_always_prefixed_and_routed()
         .collect();
     assert_eq!(
         names,
-        vec!["search_documents", "list_graphs", "control_list_graphs", "control_create_graph"]
+        vec![
+            "search_documents",
+            "list_graphs",
+            "control_list_graphs",
+            "control_create_graph"
+        ]
     );
     // Cell tools advertise the routing argument; control tools do not.
-    assert_eq!(tools["tools"][0]["inputSchema"]["properties"]["graph_id"]["type"], json!("string"));
-    assert_eq!(tools["tools"][0]["inputSchema"]["properties"]["graphId"]["type"], json!("string"));
-    assert_eq!(tools["tools"][0]["inputSchema"]["properties"]["query"]["type"], json!("string"));
-    assert!(tools["tools"][3]["inputSchema"]["properties"].get("graph_id").is_none());
+    assert_eq!(
+        tools["tools"][0]["inputSchema"]["properties"]["graph_id"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        tools["tools"][0]["inputSchema"]["properties"]["graphId"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        tools["tools"][0]["inputSchema"]["properties"]["query"]["type"],
+        json!("string")
+    );
+    assert!(tools["tools"][3]["inputSchema"]["properties"]
+        .get("graph_id")
+        .is_none());
 
     // Unprefixed `list_graphs` is the cell's; the prefixed one is control's,
     // forwarded under its upstream name. Bare `create_graph` is not a tool.
-    let cell = gw.call_tool(json!({ "name": "list_graphs", "arguments": {} })).await.unwrap();
+    let cell = gw
+        .call_tool(json!({ "name": "list_graphs", "arguments": {} }))
+        .await
+        .unwrap();
     assert_eq!(cell["structuredContent"]["cell"], json!("notes"));
     let control = gw
         .call_tool(json!({ "name": "control_list_graphs", "arguments": {} }))
@@ -433,7 +487,10 @@ async fn tools_list_is_the_union_with_control_tools_always_prefixed_and_routed()
         .call_tool(json!({ "name": "control_create_graph", "arguments": { "graphId": "n2" } }))
         .await
         .unwrap();
-    assert_eq!(created["structuredContent"]["control"], json!("create_graph"));
+    assert_eq!(
+        created["structuredContent"]["control"],
+        json!("create_graph")
+    );
     let err = gw
         .call_tool(json!({ "name": "create_graph", "arguments": { "graphId": "n2" } }))
         .await
@@ -459,34 +516,57 @@ async fn tools_list_pagination_appends_control_tools_only_on_the_last_page() {
         .await;
     Mock::given(method("POST"))
         .and(path(cell_path("notes")))
-        .and(body_partial_json(json!({ "method": "tools/list", "params": { "cursor": "p2" } })))
+        .and(body_partial_json(
+            json!({ "method": "tools/list", "params": { "cursor": "p2" } }),
+        ))
         .respond_with(rpc_ok(json!({ "tools": [{ "name": "page_two_tool" }] })))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path(cell_path("notes")))
         .and(body_partial_json(json!({ "method": "tools/list" })))
-        .respond_with(rpc_ok(json!({ "tools": [{ "name": "page_one_tool" }], "nextCursor": "p2" })))
+        .respond_with(rpc_ok(
+            json!({ "tools": [{ "name": "page_one_tool" }], "nextCursor": "p2" }),
+        ))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path(cell_path("notes")))
-        .and(body_partial_json(json!({ "method": "tools/call", "params": { "name": "page_one_tool" } })))
-        .respond_with(rpc_ok(json!({ "content": [], "structuredContent": { "page": 1 } })))
+        .and(body_partial_json(
+            json!({ "method": "tools/call", "params": { "name": "page_one_tool" } }),
+        ))
+        .respond_with(rpc_ok(
+            json!({ "content": [], "structuredContent": { "page": 1 } }),
+        ))
         .mount(&server)
         .await;
 
     let gw = connect(&server, "notes").await;
     let first = gw.list_tools(json!({})).await.unwrap();
     let names = |v: &Value| -> Vec<String> {
-        v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+        v["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
     };
     assert_eq!(names(&first), vec!["page_one_tool"]);
     assert_eq!(first["nextCursor"], json!("p2"));
     let second = gw.list_tools(json!({ "cursor": "p2" })).await.unwrap();
-    assert_eq!(names(&second), vec!["page_two_tool", "control_list_graphs", "control_create_graph"]);
+    assert_eq!(
+        names(&second),
+        vec![
+            "page_two_tool",
+            "control_list_graphs",
+            "control_create_graph"
+        ]
+    );
     // Page-one routes survived the page-two refresh.
-    let out = gw.call_tool(json!({ "name": "page_one_tool", "arguments": {} })).await.unwrap();
+    let out = gw
+        .call_tool(json!({ "name": "page_one_tool", "arguments": {} }))
+        .await
+        .unwrap();
     assert_eq!(out["structuredContent"]["page"], json!(1));
 }
 
@@ -510,8 +590,12 @@ async fn graph_id_argument_routes_to_the_sibling_cell_by_path_with_one_cached_se
         .await;
     Mock::given(method("POST"))
         .and(path(cell_path("scratch")))
-        .and(body_partial_json(json!({ "method": "tools/call", "params": { "name": "search_documents" } })))
-        .respond_with(rpc_ok(json!({ "content": [], "structuredContent": { "cell": "scratch" } })))
+        .and(body_partial_json(
+            json!({ "method": "tools/call", "params": { "name": "search_documents" } }),
+        ))
+        .respond_with(rpc_ok(
+            json!({ "content": [], "structuredContent": { "cell": "scratch" } }),
+        ))
         .expect(2)
         .mount(&server)
         .await;
@@ -571,8 +655,15 @@ async fn disagreeing_graph_id_and_graph_id_camel_are_refused_before_any_request(
         .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("disagree"), "got: {msg}");
-    assert!(msg.contains("notes") && msg.contains("scratch"), "got: {msg}");
-    assert_eq!(requests_to(&server, "/mcp").await, before, "no request may be made");
+    assert!(
+        msg.contains("notes") && msg.contains("scratch"),
+        "got: {msg}"
+    );
+    assert_eq!(
+        requests_to(&server, "/mcp").await,
+        before,
+        "no request may be made"
+    );
 
     // Agreement: forwarded as ONE consistent value on the routed path.
     let out = gw
@@ -586,7 +677,10 @@ async fn disagreeing_graph_id_and_graph_id_camel_are_refused_before_any_request(
         .into_iter()
         .find(|b| b["method"] == json!("tools/call"))
         .unwrap();
-    assert_eq!(call["params"]["arguments"], json!({ "graph_id": "scratch", "q": 1 }));
+    assert_eq!(
+        call["params"]["arguments"],
+        json!({ "graph_id": "scratch", "q": 1 })
+    );
 }
 
 #[tokio::test]
@@ -602,9 +696,16 @@ async fn graph_id_naming_an_unlisted_graph_is_refused_before_any_graph_path_requ
         .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("'ghost'"), "got: {msg}");
-    assert!(msg.contains("not in this identity's list_graphs"), "got: {msg}");
+    assert!(
+        msg.contains("not in this identity's list_graphs"),
+        "got: {msg}"
+    );
     assert!(msg.contains("will not activate or create"), "got: {msg}");
-    assert_eq!(requests_to(&server, "/g/ghost/").await, 0, "no request may touch the unlisted graph's path");
+    assert_eq!(
+        requests_to(&server, "/g/ghost/").await,
+        0,
+        "no request may touch the unlisted graph's path"
+    );
     // The listing was refreshed once before refusing (a graph may have been
     // created after connect): connect + tools/list + refresh.
     assert_eq!(requests_to(&server, "/control/mcp").await, 3);
@@ -614,9 +715,17 @@ async fn graph_id_naming_an_unlisted_graph_is_refused_before_any_graph_path_requ
 async fn listing_is_replaced_on_refresh_so_a_revoked_graph_stops_routing() {
     // M6: a row that disappears from list_graphs is forgotten, not unioned.
     let server = MockServer::start().await;
-    let with_scratch = listing_response(vec![row(OWNER, "notes", "active"), row(OWNER, "scratch", "active")]);
+    let with_scratch = listing_response(vec![
+        row(OWNER, "notes", "active"),
+        row(OWNER, "scratch", "active"),
+    ]);
     let without = listing_response(vec![row(OWNER, "notes", "active")]);
-    mount_control_with(&server, "/control/mcp", FlipAfter::new(1, with_scratch, without)).await;
+    mount_control_with(
+        &server,
+        "/control/mcp",
+        FlipAfter::new(1, with_scratch, without),
+    )
+    .await;
     mount_warm_cell(&server, "notes").await;
     mount_warm_cell(&server, "scratch").await;
 
@@ -632,8 +741,15 @@ async fn listing_is_replaced_on_refresh_so_a_revoked_graph_stops_routing() {
         .await
         .unwrap_err();
     let msg = format!("{err:#}");
-    assert!(msg.contains("'scratch'") && msg.contains("not in this identity's list_graphs"), "got: {msg}");
-    assert_eq!(requests_to(&server, "/g/scratch/").await, 0, "a revoked graph must never be activated");
+    assert!(
+        msg.contains("'scratch'") && msg.contains("not in this identity's list_graphs"),
+        "got: {msg}"
+    );
+    assert_eq!(
+        requests_to(&server, "/g/scratch/").await,
+        0,
+        "a revoked graph must never be activated"
+    );
 }
 
 #[tokio::test]
@@ -642,7 +758,10 @@ async fn a_tombstoned_listing_row_is_never_activated() {
     mount_control_with(
         &server,
         "/control/mcp",
-        listing_response(vec![row(OWNER, "notes", "active"), row(OWNER, "dead", "tombstoned")]),
+        listing_response(vec![
+            row(OWNER, "notes", "active"),
+            row(OWNER, "dead", "tombstoned"),
+        ]),
     )
     .await;
     mount_warm_cell(&server, "notes").await;
@@ -654,7 +773,10 @@ async fn a_tombstoned_listing_row_is_never_activated() {
         .await
         .unwrap_err();
     let msg = format!("{err:#}");
-    assert!(msg.contains("'dead'") && msg.contains("not activatable"), "got: {msg}");
+    assert!(
+        msg.contains("'dead'") && msg.contains("not activatable"),
+        "got: {msg}"
+    );
     assert!(msg.contains("tombstoned"), "got: {msg}");
     assert_eq!(requests_to(&server, "/g/dead/").await, 0);
 }
@@ -666,7 +788,10 @@ async fn a_graph_shared_by_another_owner_routes_to_the_listing_owners_path() {
     mount_control_with(
         &server,
         "/control/mcp",
-        listing_response(vec![row(OWNER, "notes", "active"), row(FRIEND, "shared", "active")]),
+        listing_response(vec![
+            row(OWNER, "notes", "active"),
+            row(FRIEND, "shared", "active"),
+        ]),
     )
     .await;
     mount_warm_cell(&server, "notes").await;
@@ -679,7 +804,10 @@ async fn a_graph_shared_by_another_owner_routes_to_the_listing_owners_path() {
         .unwrap();
     assert_eq!(out["structuredContent"]["cell"], json!("shared"));
     assert_eq!(out["structuredContent"]["owner_path"], json!(FRIEND_PATH));
-    assert_eq!(requests_to(&server, &format!("/o/{OWNER_PATH}/g/shared/")).await, 0);
+    assert_eq!(
+        requests_to(&server, &format!("/o/{OWNER_PATH}/g/shared/")).await,
+        0
+    );
     assert_eq!(requests_to(&server, "/o/user%3Amallory/").await, 0);
 }
 
@@ -718,7 +846,10 @@ async fn gateway_403_on_a_listed_graph_is_surfaced_verbatim_and_never_reaches_mc
     mount_warm_cell(&server, "notes").await;
     Mock::given(method("POST"))
         .and(path(activate_path("private")))
-        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "error": "forbidden: viewer role required" })))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(json!({ "error": "forbidden: viewer role required" })),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -730,7 +861,10 @@ async fn gateway_403_on_a_listed_graph_is_surfaced_verbatim_and_never_reaches_mc
         .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("HTTP 403"), "got: {msg}");
-    assert!(msg.contains("forbidden: viewer role required"), "got: {msg}");
+    assert!(
+        msg.contains("forbidden: viewer role required"),
+        "got: {msg}"
+    );
     assert!(msg.contains("private"), "got: {msg}");
     assert_eq!(requests_to(&server, "/g/private/mcp").await, 0);
     server.verify().await;
@@ -743,7 +877,10 @@ async fn gateway_404_for_a_listed_but_vanished_graph_is_surfaced_verbatim() {
     mount_warm_cell(&server, "notes").await;
     Mock::given(method("POST"))
         .and(path(activate_path("gone")))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "error": "not found: graph 'user:owner-sub/gone'" })))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(json!({ "error": "not found: graph 'user:owner-sub/gone'" })),
+        )
         .mount(&server)
         .await;
 
@@ -754,7 +891,10 @@ async fn gateway_404_for_a_listed_but_vanished_graph_is_surfaced_verbatim() {
         .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("HTTP 404"), "got: {msg}");
-    assert!(msg.contains("not found: graph 'user:owner-sub/gone'"), "got: {msg}");
+    assert!(
+        msg.contains("not found: graph 'user:owner-sub/gone'"),
+        "got: {msg}"
+    );
     assert_eq!(requests_to(&server, "/g/gone/mcp").await, 0);
 }
 
@@ -774,7 +914,9 @@ async fn unknown_tool_is_tool_not_found_naming_the_tool() {
     // Never forwarded to either upstream.
     let requests = server.received_requests().await.unwrap();
     assert!(
-        !requests.iter().any(|r| String::from_utf8_lossy(&r.body).contains("frobnicate")),
+        !requests
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains("frobnicate")),
         "unknown tool must not be forwarded"
     );
 }
@@ -804,13 +946,23 @@ async fn cell_that_answers_503_forever_times_out_naming_budget_and_last_state() 
     let msg = format!("{err:#}");
     assert!(msg.contains("is not routable after"), "got: {msg}");
     assert!(msg.contains("activation budget 0.4s"), "got: {msg}");
-    assert!(msg.contains("last observed activation state: cell path answered HTTP 503"), "got: {msg}");
+    assert!(
+        msg.contains("last observed activation state: cell path answered HTTP 503"),
+        "got: {msg}"
+    );
     assert!(msg.contains("at_capacity"), "got: {msg}");
-    assert!(!msg.to_lowercase().contains("not found"), "must never claim not-found: {msg}");
+    assert!(
+        !msg.to_lowercase().contains("not found"),
+        "must never claim not-found: {msg}"
+    );
     assert!(gw.last_wait_polls() >= 2, "polls: {}", gw.last_wait_polls());
     // L3: re-probes back off (20/40/80/160 ms → a handful, not dozens) and
     // the wait POSTed activate at most once (here: zero — the kick did it).
-    assert!(requests_to(&server, "/g/notes/mcp").await <= 8, "{}", requests_to(&server, "/g/notes/mcp").await);
+    assert!(
+        requests_to(&server, "/g/notes/mcp").await <= 8,
+        "{}",
+        requests_to(&server, "/g/notes/mcp").await
+    );
     assert_eq!(requests_to(&server, "/g/notes/activate").await, 1);
 
     // A tool call gets the same truthful error (fresh budget), not a hang,
@@ -821,7 +973,10 @@ async fn cell_that_answers_503_forever_times_out_naming_budget_and_last_state() 
         .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("last observed activation state"), "got: {msg}");
-    assert!(requests_to(&server, "/g/notes/activate").await <= 2, "at most one activate per wait");
+    assert!(
+        requests_to(&server, "/g/notes/activate").await <= 2,
+        "at most one activate per wait"
+    );
 }
 
 #[tokio::test]
@@ -849,7 +1004,10 @@ async fn a_hung_upstream_cannot_stretch_the_wait_past_its_budget() {
     let err = gw.warm().await.unwrap_err();
     let elapsed = started.elapsed();
     let msg = format!("{err:#}");
-    assert!(elapsed < Duration::from_millis(1000), "warm() took {elapsed:?}: {msg}");
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "warm() took {elapsed:?}: {msg}"
+    );
     assert!(msg.contains("is not routable after"), "got: {msg}");
     assert!(msg.contains("request timed out after"), "got: {msg}");
     assert!(msg.contains("(initialize)"), "got: {msg}");
@@ -868,7 +1026,10 @@ async fn a_waiter_queued_behind_warm_pays_one_budget_not_two() {
         .await;
     Mock::given(method("POST"))
         .and(path(cell_path("notes")))
-        .respond_with(ResponseTemplate::new(503).set_body_json(json!({ "error": "wedged", "code": "at_capacity" })))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_json(json!({ "error": "wedged", "code": "at_capacity" })),
+        )
         .mount(&server)
         .await;
 
@@ -883,12 +1044,18 @@ async fn a_waiter_queued_behind_warm_pays_one_budget_not_two() {
         .unwrap_err();
     let elapsed = started.elapsed();
     let msg = format!("{err:#}");
-    assert!(elapsed < Duration::from_millis(650), "foreground waited {elapsed:?}: {msg}");
+    assert!(
+        elapsed < Duration::from_millis(650),
+        "foreground waited {elapsed:?}: {msg}"
+    );
     // Whether it timed out on the lock ("queued behind another waiter") or
     // got the lock late and ran a short wait of its own, the error is truthful.
     assert!(msg.contains("is not routable after 0."), "got: {msg}");
     assert!(msg.contains("last observed activation state"), "got: {msg}");
-    assert!(msg.contains("HTTP 503") && msg.contains("wedged"), "got: {msg}");
+    assert!(
+        msg.contains("HTTP 503") && msg.contains("wedged"),
+        "got: {msg}"
+    );
     let _ = warm_task.await.unwrap();
 }
 
@@ -981,7 +1148,9 @@ async fn an_off_origin_poll_url_is_refused_and_never_receives_credentials() {
         .await;
     Mock::given(method("GET"))
         .and(path("/activations/cell-1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "phase": "ready", "events": [] })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "phase": "ready", "events": [] })),
+        )
         .expect(0)
         .mount(&foreign)
         .await;
@@ -1049,7 +1218,9 @@ async fn a_poll_url_with_the_base_as_userinfo_before_a_foreign_host_is_refused()
     .await;
     Mock::given(method("GET"))
         .and(path("/activations/cell-1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "phase": "ready", "events": [] })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "phase": "ready", "events": [] })),
+        )
         .expect(0)
         .mount(&foreign)
         .await;
@@ -1084,7 +1255,9 @@ async fn an_on_origin_poll_url_that_redirects_off_origin_is_not_followed() {
         .await;
     Mock::given(method("GET"))
         .and(path("/activations/cell-1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "phase": "ready", "events": [] })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "phase": "ready", "events": [] })),
+        )
         .expect(0)
         .mount(&foreign)
         .await;
@@ -1092,10 +1265,17 @@ async fn an_on_origin_poll_url_that_redirects_off_origin_is_not_followed() {
     let gw = connect(&server, "notes").await;
     let msg = format!("{:#}", gw.warm().await.unwrap_err());
     assert!(msg.contains("HTTP 302"), "got: {msg}");
-    assert!(msg.contains("redirect to") && msg.contains(&target), "got: {msg}");
+    assert!(
+        msg.contains("redirect to") && msg.contains(&target),
+        "got: {msg}"
+    );
     assert!(msg.contains("not followed"), "got: {msg}");
     assert_eq!(foreign.received_requests().await.unwrap().len(), 0);
-    assert_eq!(requests_to(&server, "/g/notes/mcp").await, 0, "a redirect must not count as ready");
+    assert_eq!(
+        requests_to(&server, "/g/notes/mcp").await,
+        0,
+        "a redirect must not count as ready"
+    );
     foreign.verify().await;
 }
 
@@ -1127,7 +1307,10 @@ async fn a_200_on_health_is_not_readiness_only_mcp_initialize_counts() {
         .await;
     Mock::given(method("POST"))
         .and(path(cell_path("notes")))
-        .respond_with(ResponseTemplate::new(503).set_body_json(json!({ "error": "wedged", "code": "at_capacity" })))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_json(json!({ "error": "wedged", "code": "at_capacity" })),
+        )
         .mount(&server)
         .await;
 
@@ -1256,9 +1439,19 @@ async fn repair_required_503_on_the_cell_path_is_one_request_and_an_immediate_er
         .unwrap();
     let started = Instant::now();
     let msg = format!("{:#}", gw.warm().await.unwrap_err());
-    assert!(started.elapsed() < Duration::from_millis(500), "took {:?}", started.elapsed());
-    assert!(msg.contains("HTTP 503") && msg.contains("graph_repair_required"), "got: {msg}");
-    assert!(!msg.contains("is not routable after"), "must not be a budget timeout: {msg}");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        msg.contains("HTTP 503") && msg.contains("graph_repair_required"),
+        "got: {msg}"
+    );
+    assert!(
+        !msg.contains("is not routable after"),
+        "must not be a budget timeout: {msg}"
+    );
     assert_eq!(requests_to(&server, "/g/notes/mcp").await, 1);
     server.verify().await;
 }
@@ -1276,7 +1469,10 @@ async fn control_tool_array_structured_content_reaches_the_client_as_items() {
     mount_warm_cell(&server, "notes").await;
 
     let gw = connect(&server, "notes").await;
-    let rows = json!([row(OWNER, "notes", "active"), row(OWNER, "scratch", "active")]);
+    let rows = json!([
+        row(OWNER, "notes", "active"),
+        row(OWNER, "scratch", "active")
+    ]);
 
     // Backend level: verbatim (the array is what the gateway sent).
     let raw = gw
@@ -1288,7 +1484,11 @@ async fn control_tool_array_structured_content_reaches_the_client_as_items() {
     // Client level: an object, with the array intact under `items`; `content`
     // is exactly what the gateway sent.
     let seen = client_calls(&gw, "control_list_graphs", json!({})).await;
-    assert_eq!(seen["structuredContent"], json!({ "items": rows }), "got: {seen}");
+    assert_eq!(
+        seen["structuredContent"],
+        json!({ "items": rows }),
+        "got: {seen}"
+    );
     assert!(seen["structuredContent"].is_object());
     assert_eq!(seen["content"], json!([]));
 }
@@ -1307,7 +1507,10 @@ async fn cell_tool_object_structured_content_is_unchanged_at_the_client() {
         .await
         .unwrap();
     let seen = client_calls(&gw, "search_documents", json!({ "query": "q" })).await;
-    assert_eq!(seen, raw, "client envelope must equal the upstream envelope");
+    assert_eq!(
+        seen, raw,
+        "client envelope must equal the upstream envelope"
+    );
     assert_eq!(
         seen["structuredContent"],
         json!({ "cell": "notes", "owner_path": OWNER_PATH })

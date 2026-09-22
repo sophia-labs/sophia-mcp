@@ -4,10 +4,16 @@
 //! and JSON-RPC error surfacing. The gateway (multi-graph) backend is covered
 //! in `tests/gateway_multigraph.rs`.
 
+use std::time::Duration;
+
 use serde_json::json;
 use sophia_mcp::backend::{AuthHeaders, Backend, RemoteHttp};
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn test_timeout() -> Duration {
+    Duration::from_secs(30)
+}
 
 #[tokio::test]
 async fn remote_tools_list_passthrough_with_auth() {
@@ -38,6 +44,8 @@ async fn remote_tools_list_passthrough_with_auth() {
             on_behalf_of: Some("user-sub".into()),
             ..Default::default()
         },
+        test_timeout(),
+        false,
     )
     .unwrap();
 
@@ -70,6 +78,8 @@ async fn remote_tools_call_passthrough() {
     let backend = RemoteHttp::new(
         RemoteHttp::resolve_mcp_url(&server.uri(), None),
         AuthHeaders::default(),
+        test_timeout(),
+        false,
     )
     .unwrap();
 
@@ -97,6 +107,8 @@ async fn remote_surfaces_jsonrpc_error() {
     let backend = RemoteHttp::new(
         RemoteHttp::resolve_mcp_url(&server.uri(), None),
         AuthHeaders::default(),
+        test_timeout(),
+        false,
     )
     .unwrap();
 

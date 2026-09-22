@@ -69,6 +69,11 @@ pub struct LocalGardenOptions {
     pub port: u16,
     /// How long to wait for `/health` to come up.
     pub health_timeout: Duration,
+    /// Per-request ceiling for the steady-state proxy client to gardend's
+    /// loopback, once it's up (distinct from `health_timeout`, which only
+    /// bounds the BOOT wait). Same `--request-timeout` value the gateway
+    /// backend uses — see `remote::build_client`.
+    pub request_timeout: Duration,
 }
 
 pub struct LocalGarden {
@@ -171,6 +176,13 @@ impl LocalGarden {
                 origin: Some("http://127.0.0.1".to_string()),
                 ..Default::default()
             },
+            opts.request_timeout,
+            // Always `http://127.0.0.1:<port>/mcp` — always loopback, by
+            // construction, never a real "insecure http" exposure. `true`
+            // here just means "this specific, hardcoded loopback URL never
+            // needs the global --allow-insecure-http flag to proceed", not
+            // that this connection is actually insecure.
+            true,
         )?;
 
         // Poll /health until ready (the manifest can land a beat before the

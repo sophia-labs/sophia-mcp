@@ -24,6 +24,7 @@
 //! special-casing at this layer.
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -84,8 +85,15 @@ impl ComposedBackend {
     /// `primary`. Never fails because a sub is down — that is exactly the
     /// resilience this type exists to provide; a genuinely malformed `spec`
     /// (an unparseable `mcp_url`, which cannot happen for specs produced by
-    /// `config::parse_sub_specs`) is the only way this can error.
-    pub async fn compose(primary: Arc<dyn Backend>, specs: Vec<SubSpec>) -> anyhow::Result<Self> {
+    /// `config::parse_sub_specs`) — or one that would send its bearer over
+    /// plain `http://` to a non-loopback host without `allow_insecure_http`
+    /// — is the only way this can error.
+    pub async fn compose(
+        primary: Arc<dyn Backend>,
+        specs: Vec<SubSpec>,
+        request_timeout: Duration,
+        allow_insecure_http: bool,
+    ) -> anyhow::Result<Self> {
         let mut subs = Vec::with_capacity(specs.len());
         for spec in specs {
             let mcp_url = RemoteHttp::resolve_mcp_url(&spec.url, None);
@@ -95,6 +103,8 @@ impl ComposedBackend {
                     bearer: spec.token.clone(),
                     ..Default::default()
                 },
+                request_timeout,
+                allow_insecure_http,
             )
             .with_context(|| format!("building client for sub '{}' ({mcp_url})", spec.prefix))?;
 
@@ -161,9 +171,7 @@ impl Backend for ComposedBackend {
     /// sign of it being skipped (`tools/call` to it is the loud sign).
     async fn list_tools(&self, params: Value) -> anyhow::Result<Value> {
         let mut result = self.primary.list_tools(params).await?;
-        let paged = result
-            .get("nextCursor")
-            .is_some_and(|c| !c.is_null());
+        let paged = result.get("nextCursor").is_some_and(|c| !c.is_null());
         if !paged && !self.subs.is_empty() {
             let mut tools = result
                 .get("tools")
@@ -185,7 +193,10 @@ impl Backend for ComposedBackend {
     /// A down sub is [`ToolNotFound`] without a network call. Anything else
     /// falls through to the primary unchanged.
     async fn call_tool(&self, mut params: Value) -> anyhow::Result<Value> {
-        let name = params.get("name").and_then(Value::as_str).map(str::to_string);
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         if let Some(name) = &name {
             for sub in &self.subs {
                 let Some(bare) = name.strip_prefix(&format!("{}_", sub.prefix)) else {

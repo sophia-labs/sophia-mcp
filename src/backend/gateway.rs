@@ -44,7 +44,10 @@ use serde_json::{json, Value};
 
 use crate::mcp::{self, method};
 
-use super::remote::{build_client, post_rpc, rpc_result, urlencode_segment, HttpReply};
+use super::remote::{
+    build_client, post_rpc, read_bounded_text, redact_body, rpc_result, urlencode_segment,
+    HttpReply, MAX_RESPONSE_BYTES,
+};
 use super::{AuthHeaders, Backend, ToolNotFound};
 
 /// The gateway's terminal activation phases (`platform-next/gateway/src/activation.rs`,
@@ -83,6 +86,9 @@ pub struct GatewayOptions {
     pub request_timeout: Duration,
     /// Also try `{base}/mcp` for control tools when `/control/mcp` is 404.
     pub unified_mcp_fallback: bool,
+    /// Allow sending the bearer token over plain `http://` to a non-loopback
+    /// gateway base. Default `false` — see `remote::build_client`.
+    pub allow_insecure_http: bool,
 }
 
 impl Default for GatewayOptions {
@@ -92,6 +98,7 @@ impl Default for GatewayOptions {
             activation_poll: Duration::from_secs(2),
             request_timeout: Duration::from_secs(120),
             unified_mcp_fallback: false,
+            allow_insecure_http: false,
         }
     }
 }
@@ -201,7 +208,7 @@ impl GatewayBackend {
             return Err(anyhow!("owner and graph must be non-empty"));
         }
         let base = gateway_base(raw_base);
-        let client = build_client(auth)?;
+        let client = build_client(auth, &base, opts.request_timeout, opts.allow_insecure_http)?;
         let (control_url, graphs) = probe_control(
             &client,
             &base,
@@ -327,10 +334,10 @@ impl GatewayBackend {
                     .or_default()
                     .push(owner.to_string());
             } else {
-                next.dormant.entry(graph.to_string()).or_default().push((
-                    owner.to_string(),
-                    state.unwrap_or_default(),
-                ));
+                next.dormant
+                    .entry(graph.to_string())
+                    .or_default()
+                    .push((owner.to_string(), state.unwrap_or_default()));
             }
         }
         tracing::debug!(
@@ -397,7 +404,11 @@ impl GatewayBackend {
 
     /// The bound tuple must be listed under exactly the `--owner` given.
     fn assert_bound_listed(&self) -> anyhow::Result<()> {
-        if self.owners_of(&self.bound_graph).iter().any(|o| o == &self.owner) {
+        if self
+            .owners_of(&self.bound_graph)
+            .iter()
+            .any(|o| o == &self.owner)
+        {
             return Ok(());
         }
         let err = self.not_listed_error(&self.bound_graph);
@@ -474,7 +485,7 @@ impl GatewayBackend {
                 Ok(())
             }
             s if is_retryable(s, &body) => {
-                let state = format!("activate answered HTTP {s}: {}", reply.body.trim());
+                let state = format!("activate answered HTTP {s}: {}", redact_body(&reply.body));
                 session.observe(&state);
                 tracing::warn!(
                     graph = %session.label(),
@@ -584,7 +595,7 @@ impl GatewayBackend {
                                 s if is_retryable(s, &body) => {
                                     last_state = format!(
                                         "activate answered HTTP {s}: {}",
-                                        reply.body.trim()
+                                        redact_body(&reply.body)
                                     );
                                     step = Step::Probe;
                                 }
@@ -643,7 +654,7 @@ impl GatewayBackend {
                                 s if is_retryable(s, &body) => {
                                     last_state = format!(
                                         "activation poll answered HTTP {s}: {}",
-                                        reply.body.trim()
+                                        redact_body(&reply.body)
                                     );
                                 }
                                 s => {
@@ -706,8 +717,9 @@ impl GatewayBackend {
                                 }
                             }
                             CellReply::Unavailable { status, body } => {
-                                last_state =
-                                    format!("cell path answered HTTP {status}: {}", body.trim());
+                                // `body` was already redacted when this
+                                // CellReply was constructed (classify_cell_reply).
+                                last_state = format!("cell path answered HTTP {status}: {body}");
                                 if !activated {
                                     step = Step::Activate;
                                     continue;
@@ -751,9 +763,12 @@ impl GatewayBackend {
         )
     }
 
-    /// The gateway said no (403/404/400/…): surface status + body verbatim.
-    /// The gateway is the policy-enforcement point; sophia-mcp does not
-    /// reinterpret its verdicts.
+    /// The gateway said no (403/404/400/…): surface status + a bounded,
+    /// redacted rendering of the body. The gateway is the policy-enforcement
+    /// point; sophia-mcp does not reinterpret its verdicts, but it also does
+    /// not ship an unbounded upstream body to its own client — see
+    /// `remote::redact_body`. The single choke point for every caller of
+    /// this function (activate, activation poll, and cell-path rejections).
     fn gateway_rejection(
         &self,
         label: &str,
@@ -763,7 +778,7 @@ impl GatewayBackend {
     ) -> anyhow::Error {
         anyhow!(
             "gateway returned HTTP {status} for {what} of graph '{label}': {}",
-            body.trim()
+            redact_body(body)
         )
     }
 
@@ -808,7 +823,9 @@ impl GatewayBackend {
             .await
             .with_context(|| format!("POST {}", session.activate_url))?;
         let status = http.status();
-        let body = http.text().await.context("read activate response body")?;
+        let body = read_bounded_text(http, &session.activate_url, MAX_RESPONSE_BYTES)
+            .await
+            .context("read activate response body")?;
         Ok(HttpReply { status, body })
     }
 
@@ -829,9 +846,14 @@ impl GatewayBackend {
                 .unwrap_or("<no Location header>")
                 .to_string()
         });
-        let mut body = http.text().await.context("read activation poll body")?;
+        let mut body = read_bounded_text(http, url, MAX_RESPONSE_BYTES)
+            .await
+            .context("read activation poll body")?;
         if let Some(location) = location {
-            body = format!("redirect to '{location}' not followed; {}", body.trim());
+            body = format!(
+                "redirect to '{location}' not followed; {}",
+                redact_body(&body)
+            );
         }
         Ok(HttpReply { status, body })
     }
@@ -860,7 +882,11 @@ impl GatewayBackend {
     async fn control_rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         let what = format!("POST {} ({method})", self.control_url);
         let reply = self
-            .bounded(&what, None, post_rpc(&self.client, &self.control_url, method, params))
+            .bounded(
+                &what,
+                None,
+                post_rpc(&self.client, &self.control_url, method, params),
+            )
             .await?;
         rpc_result(reply, method).with_context(|| format!("control plane {}", self.control_url))
     }
@@ -907,7 +933,8 @@ impl GatewayBackend {
                     state
                 }
                 CellReply::Unavailable { status, body } => {
-                    format!("cell path answered HTTP {status}: {}", body.trim())
+                    // Already redacted at construction (classify_cell_reply).
+                    format!("cell path answered HTTP {status}: {body}")
                 }
             };
             session.invalidate().await;
@@ -921,7 +948,13 @@ impl GatewayBackend {
                 "cell answered not-routable mid-session; re-waiting for activation"
             );
             if Instant::now() >= deadline {
-                return Err(self.timeout_error(&session.label(), started, retries, "retries", &state));
+                return Err(self.timeout_error(
+                    &session.label(),
+                    started,
+                    retries,
+                    "retries",
+                    &state,
+                ));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             tokio::time::sleep(self.opts.activation_poll.min(remaining)).await;
@@ -961,7 +994,12 @@ impl GatewayBackend {
         if !self.catalog_built.load(Ordering::SeqCst) {
             self.refresh_catalog(json!({})).await?;
         }
-        Ok(self.routing.lock().expect("routing lock").get(name).cloned())
+        Ok(self
+            .routing
+            .lock()
+            .expect("routing lock")
+            .get(name)
+            .cloned())
     }
 }
 
@@ -1104,7 +1142,7 @@ async fn control_list_graphs(
     )
     .await?;
     if reply.status == StatusCode::NOT_FOUND {
-        return Err(ControlError::NotFound(reply.body.trim().to_string()));
+        return Err(ControlError::NotFound(redact_body(&reply.body)));
     }
     let result = rpc_result(reply, "tools/call list_graphs")?;
     let graphs = result
@@ -1205,37 +1243,61 @@ fn describe_activation(record: &Value) -> String {
 
 enum CellReply {
     Result(Value),
-    RpcError { code: i64, message: String },
+    RpcError {
+        code: i64,
+        message: String,
+    },
     /// HTTP 202 `graph_activating` from the owner-scoped cell path.
-    Activating { poll_url: Option<String>, state: String },
+    Activating {
+        poll_url: Option<String>,
+        state: String,
+    },
     /// 502 `CellUnavailable` / 503 at-capacity etc. — retry after a wait.
-    Unavailable { status: StatusCode, body: String },
+    Unavailable {
+        status: StatusCode,
+        body: String,
+    },
     /// Any other non-2xx: the gateway's verdict, surfaced verbatim.
-    Rejected { status: StatusCode, body: String },
+    Rejected {
+        status: StatusCode,
+        body: String,
+    },
 }
 
 fn classify_cell_reply(reply: HttpReply) -> CellReply {
     let status = reply.status;
     if status == StatusCode::ACCEPTED {
         let body = reply.json();
-        let code = body.get("code").and_then(Value::as_str).unwrap_or("accepted");
-        let phase = body.get("phase").and_then(Value::as_str).unwrap_or("unknown");
+        let code = body
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("accepted");
+        let phase = body
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         return CellReply::Activating {
-            poll_url: body.get("pollUrl").and_then(Value::as_str).map(str::to_string),
+            poll_url: body
+                .get("pollUrl")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             state: format!("cell path answered 202 {code}, phase={phase}"),
         };
     }
     if !status.is_success() {
         let body_json = reply.json();
+        // Redacted here, once, for both variants — every downstream consumer
+        // (wait_for_routable's Probe branch, cell_rpc's Unavailable branch,
+        // and gateway_rejection for Rejected) then already has a bounded body.
         return if is_retryable(status, &body_json) {
             CellReply::Unavailable {
                 status,
-                body: reply.body,
+                body: redact_body(&reply.body),
             }
         } else {
             CellReply::Rejected {
                 status,
-                body: reply.body,
+                body: redact_body(&reply.body),
             }
         };
     }
@@ -1249,7 +1311,10 @@ fn classify_cell_reply(reply: HttpReply) -> CellReply {
         },
         Err(e) => CellReply::RpcError {
             code: mcp::PARSE_ERROR,
-            message: format!("unparseable JSON-RPC response: {e}: {}", reply.body),
+            message: format!(
+                "unparseable JSON-RPC response: {e}: {}",
+                redact_body(&reply.body)
+            ),
         },
     }
 }
@@ -1335,22 +1400,21 @@ fn add_graph_argument(tool: &mut Value, bound_graph: &str) {
          routable. Never creates a graph: the name must already be in list_graphs, and the \
          gateway's ACL decides. Use either graph_id or graphId, not both."
     );
-    let schema = tool
-        .as_object_mut()
-        .map(|t| t.entry("inputSchema").or_insert_with(|| json!({ "type": "object" })));
+    let schema = tool.as_object_mut().map(|t| {
+        t.entry("inputSchema")
+            .or_insert_with(|| json!({ "type": "object" }))
+    });
     let Some(schema) = schema.and_then(Value::as_object_mut) else {
         return;
     };
-    let properties = schema
-        .entry("properties")
-        .or_insert_with(|| json!({}));
+    let properties = schema.entry("properties").or_insert_with(|| json!({}));
     let Some(properties) = properties.as_object_mut() else {
         return;
     };
     for key in ["graph_id", "graphId"] {
-        properties.entry(key).or_insert_with(|| {
-            json!({ "type": "string", "description": description })
-        });
+        properties
+            .entry(key)
+            .or_insert_with(|| json!({ "type": "string", "description": description }));
     }
 }
 
@@ -1377,7 +1441,12 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["search_documents", "list_graphs", "control_list_graphs", "control_create_graph"]
+            vec![
+                "search_documents",
+                "list_graphs",
+                "control_list_graphs",
+                "control_create_graph"
+            ]
         );
         assert!(merged.control_appended);
         assert!(merged.result.get("nextCursor").is_none());
@@ -1391,7 +1460,10 @@ mod tests {
             &merged.routes["control_create_graph"],
             Route::Control { upstream_name } if upstream_name == "create_graph"
         ));
-        assert!(!merged.routes.contains_key("create_graph"), "no unprefixed control route");
+        assert!(
+            !merged.routes.contains_key("create_graph"),
+            "no unprefixed control route"
+        );
         // Cell tools gained the routing argument; control tools did not.
         assert_eq!(
             merged.result["tools"][0]["inputSchema"]["properties"]["graph_id"]["type"],
@@ -1401,7 +1473,9 @@ mod tests {
             merged.result["tools"][1]["inputSchema"]["properties"]["graphId"]["type"],
             json!("string")
         );
-        assert!(merged.result["tools"][3]["inputSchema"].get("properties").is_none());
+        assert!(merged.result["tools"][3]["inputSchema"]
+            .get("properties")
+            .is_none());
     }
 
     #[test]
@@ -1418,7 +1492,10 @@ mod tests {
         assert_eq!(names, vec!["a"]);
         assert!(!merged.control_appended);
         assert_eq!(merged.result["nextCursor"], json!("c1"));
-        assert!(matches!(&merged.routes["control_list_graphs"], Route::Control { .. }));
+        assert!(matches!(
+            &merged.routes["control_list_graphs"],
+            Route::Control { .. }
+        ));
     }
 
     #[test]
@@ -1448,8 +1525,14 @@ mod tests {
             requested_graph(Some(&json!({ "graphId": " b " }))).unwrap(),
             Some("b".into())
         );
-        assert_eq!(requested_graph(Some(&json!({ "graph_id": "" }))).unwrap(), None);
-        assert_eq!(requested_graph(Some(&json!({ "graph_id": null }))).unwrap(), None);
+        assert_eq!(
+            requested_graph(Some(&json!({ "graph_id": "" }))).unwrap(),
+            None
+        );
+        assert_eq!(
+            requested_graph(Some(&json!({ "graph_id": null }))).unwrap(),
+            None
+        );
         assert_eq!(requested_graph(None).unwrap(), None);
         assert_eq!(
             requested_graph(Some(&json!({ "graph_id": "a", "graphId": "a" }))).unwrap(),
@@ -1468,7 +1551,8 @@ mod tests {
 
     #[test]
     fn normalize_leaves_exactly_one_argument_equal_to_the_path() {
-        let mut p = json!({ "name": "t", "arguments": { "graph_id": "x", "graphId": "x", "q": 1 } });
+        let mut p =
+            json!({ "name": "t", "arguments": { "graph_id": "x", "graphId": "x", "q": 1 } });
         normalize_graph_arguments(&mut p, "x");
         assert_eq!(p["arguments"], json!({ "graph_id": "x", "q": 1 }));
 
@@ -1500,7 +1584,10 @@ mod tests {
 
     #[test]
     fn repair_required_is_not_retryable_but_plain_503_is() {
-        assert!(is_retryable(StatusCode::SERVICE_UNAVAILABLE, &json!({ "code": "at_capacity" })));
+        assert!(is_retryable(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({ "code": "at_capacity" })
+        ));
         assert!(is_retryable(StatusCode::BAD_GATEWAY, &Value::Null));
         assert!(!is_retryable(
             StatusCode::SERVICE_UNAVAILABLE,

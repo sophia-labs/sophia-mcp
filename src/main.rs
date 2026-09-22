@@ -28,14 +28,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let sub_specs = cli
-        .resolved_subs()
-        .context("parsing --sub / --sub-token")?;
+    let sub_specs = cli.resolved_subs().context("parsing --sub / --sub-token")?;
     let mut backend = build_backend(&cli).await?;
     if !sub_specs.is_empty() {
         let prefixes: Vec<&str> = sub_specs.iter().map(|s| s.prefix.as_str()).collect();
         tracing::info!(subs = ?prefixes, "composing sub-MCPs above the primary backend");
-        let composed = ComposedBackend::compose(backend, sub_specs).await?;
+        let composed = ComposedBackend::compose(
+            backend,
+            sub_specs,
+            Duration::from_secs(cli.request_timeout.max(1)),
+            cli.allow_insecure_http,
+        )
+        .await?;
         tracing::info!(subs = ?composed.sub_prefixes(), "sub-MCPs composed (see above for which are up)");
         backend = Arc::new(composed);
     }
@@ -52,6 +56,7 @@ async fn build_backend(cli: &Cli) -> anyhow::Result<Arc<dyn Backend>> {
             garden_bin: cli.garden_bin.clone(),
             port: cli.local_port,
             health_timeout: Duration::from_secs(cli.local_health_timeout),
+            request_timeout: Duration::from_secs(cli.request_timeout.max(1)),
         };
         tracing::info!(
             profile = %opts.profile_dir.display(),
@@ -77,6 +82,7 @@ async fn build_backend(cli: &Cli) -> anyhow::Result<Arc<dyn Backend>> {
             activation_poll: Duration::from_secs(cli.activation_poll.max(1)),
             request_timeout: Duration::from_secs(cli.request_timeout.max(1)),
             unified_mcp_fallback: cli.unified_mcp_fallback,
+            allow_insecure_http: cli.allow_insecure_http,
         };
         let gateway = Arc::new(
             GatewayBackend::connect(&cli.backend, owner, graph, auth, opts)
@@ -107,7 +113,13 @@ async fn build_backend(cli: &Cli) -> anyhow::Result<Arc<dyn Backend>> {
     // must bind an explicit owner tuple and prove discovery first.
     let direct = cli.backend.trim_end_matches('/');
     if direct.ends_with("/mcp") && !direct.contains("/g/") {
-        let remote = RemoteHttp::new(direct, auth).context("connecting to direct Garden MCP")?;
+        let remote = RemoteHttp::new(
+            direct,
+            auth,
+            Duration::from_secs(cli.request_timeout.max(1)),
+            cli.allow_insecure_http,
+        )
+        .context("connecting to direct Garden MCP")?;
         tracing::info!(url = %remote.mcp_url(), "backend: REMOTE direct Garden MCP");
         return Ok(Arc::new(remote));
     }
