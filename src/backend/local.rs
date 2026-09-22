@@ -30,13 +30,20 @@ use super::{AuthHeaders, Backend, RemoteHttp};
 
 /// Subset of gardend's `loopback.json` manifest sophia-mcp needs (see garden
 /// `src-tauri/src/loopback_state.rs`). Field names are camelCase on the wire.
+///
+/// `token` is `Option`: sophia-mcp mints its own token and injects it into
+/// gardend's environment *before* spawning it (see `start()` below), so it
+/// already knows the token without ever reading it back from disk. Garden's
+/// manifest DTO is moving toward secret-free (a parallel workstream drops
+/// `token` from what it writes to `loopback.json`), and this proxy must not
+/// fail to deserialize — with a misleading timeout, no less — on that day.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LoopbackManifest {
     port: u16,
     api_url: String,
     mcp_url: String,
-    token: String,
+    token: Option<String>,
 }
 
 /// Options for launching the local headless garden.
@@ -90,9 +97,15 @@ impl LocalGarden {
             .env("GARDEN_LOOPBACK_PORT", opts.port.to_string())
             .env("GARDEN_LOOPBACK_TOKEN", &token)
             // gardend logs to stderr; let it flow to sophia-mcp's stderr (stdout is the
-            // MCP channel and must stay clean).
+            // MCP channel and must stay clean). Deliberately NOT Stdio::inherit()
+            // for stdout: sophia-mcp's own stdout IS the stdio JSON-RPC channel to
+            // its client, so inheriting it would hand gardend a direct line to
+            // corrupt that channel with any stray write (a panic message, a
+            // leftover println!, a library that defaults to stdout logging).
+            // Stdio::null() discards it unconditionally rather than trusting that
+            // gardend never writes there.
             .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
+            .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
@@ -112,7 +125,13 @@ impl LocalGarden {
         let remote = RemoteHttp::new(
             mcp_url.clone(),
             AuthHeaders {
-                bearer: Some(manifest.token.clone()),
+                // Prefer the token we minted and handed gardend via
+                // GARDEN_LOOPBACK_TOKEN above — we already know it, no need to
+                // trust the disk manifest for it. Fall back to manifest.token
+                // only if it's ever present and our own token were somehow
+                // unavailable; this keeps the auth path alive on the day
+                // Garden's manifest DTO drops `token` entirely.
+                bearer: Some(token.clone()).or_else(|| manifest.token.clone()),
                 // gardend's origin_ok requires a loopback / null Origin.
                 origin: Some("http://127.0.0.1".to_string()),
                 ..Default::default()
@@ -152,9 +171,44 @@ impl Backend for LocalGarden {
     }
 }
 
-/// Find the `gardend` binary: explicit override, then `$GARDEN_BIN`/PATH-ish
-/// candidates, then the sibling garden checkout's release target.
+/// Find the `gardend` binary: explicit `--garden-bin` (env `SOPHIA_MCP_GARDEN_BIN`,
+/// see `src/config.rs`) override, then a `gardend` next to the sophia-mcp
+/// executable, then the sibling garden checkout's headless example target
+/// (release, then debug), then bare `gardend` left for the OS to resolve on
+/// `PATH` at spawn time.
+///
+/// Thin wrapper around [`resolve_gardend_bin_from`] that supplies the real
+/// process `current_exe`/`current_dir`; kept separate so tests can drive the
+/// resolution logic with temp-dir fixtures instead of mutating real process
+/// state (`current_dir` is process-global and unsafe to change under
+/// parallel tests).
 fn resolve_gardend_bin(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    resolve_gardend_bin_from(explicit, exe_dir.as_deref(), &cwd)
+}
+
+/// Pure discovery logic. Resolution order:
+///
+/// 1. `explicit` (`--garden-bin` / `SOPHIA_MCP_GARDEN_BIN`) — used as-is if it
+///    exists, else an error (never silently falls through).
+/// 2. `<exe_dir>/gardend` — a `gardend` placed next to the sophia-mcp binary.
+/// 3. `<cwd>/../garden/src-tauri/target/release/examples/gardend`, then the
+///    `debug` variant — the sibling garden checkout's headless build.
+///    `gardend` is a cargo `[[example]]`, never a `[[bin]]` (garden's
+///    `src-tauri/Cargo.toml`: the desktop Tauri bundler copies every `[[bin]]`
+///    into the app bundle, so gardend is kept out of `[[bin]]` on purpose) —
+///    its real artifact always lands under `target/<profile>/examples/`, so
+///    the pre-`examples/` paths this function used to check could never exist
+///    and are dropped rather than kept as dead fallbacks.
+/// 4. Bare `gardend`, left for the OS to resolve via `PATH` at spawn time.
+fn resolve_gardend_bin_from(
+    explicit: Option<&Path>,
+    exe_dir: Option<&Path>,
+    cwd: &Path,
+) -> anyhow::Result<PathBuf> {
     if let Some(p) = explicit {
         if p.exists() {
             return Ok(p.to_path_buf());
@@ -167,15 +221,12 @@ fn resolve_gardend_bin(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
 
     let mut candidates: Vec<PathBuf> = Vec::new();
     // Next to the sophia-mcp binary.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("gardend"));
-        }
+    if let Some(dir) = exe_dir {
+        candidates.push(dir.join("gardend"));
     }
-    // Sibling garden checkout relative to cwd (dev convenience).
-    candidates.push(PathBuf::from("../garden/src-tauri/target/release/gardend"));
-    candidates.push(PathBuf::from("../garden/src-tauri/target/debug/gardend"));
-    // Bare name (let the OS resolve via PATH on spawn).
+    // Sibling garden checkout's headless example target (dev convenience).
+    candidates.push(cwd.join("../garden/src-tauri/target/release/examples/gardend"));
+    candidates.push(cwd.join("../garden/src-tauri/target/debug/examples/gardend"));
     for cand in &candidates {
         if cand.exists() {
             return Ok(cand.clone());
@@ -225,5 +276,180 @@ async fn wait_for_health(api_url: &str, timeout: Duration) -> anyhow::Result<()>
             ));
         }
         sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A unique scratch directory under the OS temp dir, removed on drop.
+    /// Hand-rolled rather than pulling in a `tempfile` dev-dependency — these
+    /// tests only need "an empty dir nobody else is using", checked purely
+    /// via `Path::exists()` on dummy files (no real gardend needed).
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "sophia-mcp-local-rs-test-{tag}-{}-{n}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        /// Create an empty dummy file at `self.path().join(rel)`, creating
+        /// parent dirs as needed, and return its full path.
+        fn touch(&self, rel: &str) -> PathBuf {
+            let p = self.0.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).expect("create parent dirs");
+            }
+            std::fs::write(&p, b"").expect("write dummy file");
+            p
+        }
+
+        /// A subdirectory to use as `cwd`, so `cwd.join("../garden/...")`
+        /// lands back on files touched at this scratch dir's root.
+        fn subdir_cwd(&self) -> PathBuf {
+            let cwd = self.0.join("cwd");
+            std::fs::create_dir_all(&cwd).expect("create cwd subdir");
+            cwd
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // ---- discovery resolution order ----
+
+    #[test]
+    fn explicit_path_wins_even_when_other_candidates_exist() {
+        let scratch = ScratchDir::new("explicit-wins");
+        let explicit_bin = scratch.touch("explicit/gardend");
+        let exe_dir = scratch.path().join("exe-dir");
+        scratch.touch("exe-dir/gardend"); // a competing, otherwise-valid candidate
+        let cwd = scratch.subdir_cwd();
+
+        let resolved = resolve_gardend_bin_from(Some(&explicit_bin), Some(&exe_dir), &cwd).unwrap();
+        assert_eq!(resolved, explicit_bin);
+    }
+
+    #[test]
+    fn explicit_path_errors_when_missing() {
+        let scratch = ScratchDir::new("explicit-missing");
+        let missing = scratch.path().join("no-such-gardend");
+        let cwd = scratch.subdir_cwd();
+
+        let err = resolve_gardend_bin_from(Some(&missing), None, &cwd).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--garden-bin") && msg.contains("no-such-gardend"),
+            "error should name --garden-bin and the missing path: {msg}"
+        );
+    }
+
+    #[test]
+    fn exe_adjacent_gardend_found_and_wins_over_sibling_checkout() {
+        let scratch = ScratchDir::new("exe-adjacent");
+        let exe_dir = scratch.path().join("exe-dir");
+        let exe_bin = scratch.touch("exe-dir/gardend");
+        // A sibling-checkout candidate is ALSO present; exe-adjacent must win.
+        scratch.touch("garden/src-tauri/target/release/examples/gardend");
+        let cwd = scratch.subdir_cwd();
+
+        let resolved = resolve_gardend_bin_from(None, Some(&exe_dir), &cwd).unwrap();
+        assert_eq!(resolved, exe_bin);
+    }
+
+    #[test]
+    fn sibling_release_examples_gardend_is_found() {
+        let scratch = ScratchDir::new("sibling-release");
+        let expected = scratch.touch("garden/src-tauri/target/release/examples/gardend");
+        let cwd = scratch.subdir_cwd();
+
+        let resolved = resolve_gardend_bin_from(None, None, &cwd).unwrap();
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            expected.canonicalize().unwrap(),
+            "expected the sibling checkout's release examples/gardend, got {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn sibling_release_examples_wins_over_debug_when_both_present() {
+        let scratch = ScratchDir::new("sibling-release-over-debug");
+        let release = scratch.touch("garden/src-tauri/target/release/examples/gardend");
+        scratch.touch("garden/src-tauri/target/debug/examples/gardend");
+        let cwd = scratch.subdir_cwd();
+
+        let resolved = resolve_gardend_bin_from(None, None, &cwd).unwrap();
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            release.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn sibling_debug_examples_gardend_is_found_when_release_missing() {
+        let scratch = ScratchDir::new("sibling-debug");
+        let debug = scratch.touch("garden/src-tauri/target/debug/examples/gardend");
+        let cwd = scratch.subdir_cwd();
+
+        let resolved = resolve_gardend_bin_from(None, None, &cwd).unwrap();
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            debug.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn path_fallback_is_last_when_nothing_else_found() {
+        let scratch = ScratchDir::new("path-fallback");
+        let cwd = scratch.subdir_cwd();
+        // No explicit, no exe dir, no sibling checkout present at all.
+
+        let resolved = resolve_gardend_bin_from(None, None, &cwd).unwrap();
+        assert_eq!(resolved, PathBuf::from("gardend"));
+    }
+
+    // ---- manifest parsing ----
+
+    #[test]
+    fn manifest_without_token_field_parses() {
+        let json = r#"{
+            "port": 8086,
+            "apiUrl": "http://127.0.0.1:8086",
+            "mcpUrl": "http://127.0.0.1:8086/mcp"
+        }"#;
+        let manifest: LoopbackManifest = serde_json::from_str(json)
+            .expect("manifest without `token` must still parse (Garden is going secret-free)");
+        assert_eq!(manifest.port, 8086);
+        assert_eq!(manifest.token, None);
+    }
+
+    #[test]
+    fn legacy_manifest_with_token_field_still_parses() {
+        let json = r#"{
+            "port": 8086,
+            "apiUrl": "http://127.0.0.1:8086",
+            "mcpUrl": "http://127.0.0.1:8086/mcp",
+            "token": "abc123"
+        }"#;
+        let manifest: LoopbackManifest =
+            serde_json::from_str(json).expect("legacy manifest with `token` must still parse");
+        assert_eq!(manifest.token.as_deref(), Some("abc123"));
     }
 }
