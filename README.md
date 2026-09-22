@@ -49,6 +49,13 @@ Your agent immediately sees garden's full tool catalog (`search_documents`,
 `read_document`, `write_document`, `remember`, `list_graphs`, …) — **none of it
 hardcoded in sophia-mcp**.
 
+**Restarting just works.** Stopping sophia-mcp and starting it again against
+the same `--profile-dir` (the common case: restarting your MCP client) spawns
+a fresh `gardend` cleanly, with no manual cleanup step. sophia-mcp clears any
+`loopback.json` left over from the prior run before spawning, so it can only
+ever observe the manifest the new `gardend` writes — never a stale one
+pointing at a now-dead port from the process that just exited.
+
 ### Prerequisite: the `gardend` binary
 
 The LOCAL backend runs garden's headless **gardend** cell binary. Garden is
@@ -374,12 +381,14 @@ tests/
 cargo test
 ```
 
-81 tests: URL resolution, auth-header construction, catalog merging (prefixing,
+84 tests: URL resolution, auth-header construction, catalog merging (prefixing,
 pagination), graph-argument parsing/normalization, sub-MCP prefix parsing/validation,
 `gardend` discovery resolution order (explicit `--garden-bin` wins and errors if
 missing, exe-adjacent, sibling-checkout `examples/` release then debug, `PATH`
-fallback last) and loopback-manifest parsing (with and without the now-optional
-`token` field), the stdio dispatch (initialize backfill, tools passthrough, `structuredContent`
+fallback last), loopback-manifest parsing (with and without the now-optional
+`token` field), and restart safety (a stale `loopback.json` from a prior run is
+cleared before spawning, and a pid-mismatched manifest is never trusted), the
+stdio dispatch (initialize backfill, tools passthrough, `structuredContent`
 normalization, notification handling, unknown method / unknown tool),
 a wiremock-backed end-to-end of the direct remote proxy, a wiremock gateway
 covering the union catalog, `graph_id` routing (listed, unlisted, revoked-on-refresh,

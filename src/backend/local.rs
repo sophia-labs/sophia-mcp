@@ -51,6 +51,12 @@ struct LoopbackManifest {
     // and `tests::legacy_manifest_with_token_field_still_parses`.
     #[allow(dead_code)]
     token: Option<String>,
+    // Garden's on-disk manifest DTO (`loopback_state.rs::LoopbackManifest`)
+    // always writes `pid: u32` (non-optional there). `Option` here purely so
+    // an older/foreign manifest missing it still parses — `wait_for_manifest`
+    // treats a missing pid as "trust it" (no gate), matching pre-fix
+    // behavior when this field can't be checked.
+    pid: Option<u32>,
 }
 
 /// Options for launching the local headless garden.
@@ -92,6 +98,18 @@ impl LocalGarden {
         // purely by env; no CLI args.
         let token = uuid::Uuid::new_v4().simple().to_string();
 
+        // A restart against a reused profile dir finds the PRIOR (now-dead)
+        // gardend's loopback.json still sitting on disk — gardend never
+        // deletes its own manifest on exit. Clear it before spawning so
+        // `wait_for_manifest` below can only ever observe the manifest the
+        // child we're about to spawn writes, never a stale one pointing at a
+        // dead port. Without this, wait_for_manifest returns instantly (the
+        // file already exists), sophia-mcp connects to the dead prior
+        // process's port, and wait_for_health times out — every restart,
+        // deterministically, until someone manually deletes loopback.json.
+        let manifest_path = opts.profile_dir.join("loopback.json");
+        clear_stale_manifest(&manifest_path)?;
+
         tracing::info!(
             binary = %bin.display(),
             profile = %opts.profile_dir.display(),
@@ -118,11 +136,18 @@ impl LocalGarden {
             .spawn()
             .with_context(|| format!("spawn gardend at {}", bin.display()))?;
 
+        // Belt-and-suspenders on top of the deletion above: gate on the
+        // spawned child's own pid (Garden's on-disk manifest DTO always
+        // writes `pid`; only its HTTP-facing DTO drops it). If some other
+        // write still raced onto this path between the clear and the spawn,
+        // wait_for_manifest keeps polling past a pid mismatch instead of
+        // trusting it.
+        let expected_pid = child.id();
+
         // Discover the loopback endpoint from the manifest gardend writes into
         // the profile dir. When port is fixed (non-zero) we already know it, but
         // reading the manifest also confirms gardend booted far enough to bind.
-        let manifest_path = opts.profile_dir.join("loopback.json");
-        let manifest = wait_for_manifest(&manifest_path, opts.health_timeout)
+        let manifest = wait_for_manifest(&manifest_path, opts.health_timeout, expected_pid)
             .await
             .context("waiting for gardend loopback manifest (loopback.json)")?;
 
@@ -246,13 +271,61 @@ fn resolve_gardend_bin_from(
     Ok(PathBuf::from("gardend"))
 }
 
-async fn wait_for_manifest(path: &Path, timeout: Duration) -> anyhow::Result<LoopbackManifest> {
+/// Remove a possibly-stale `loopback.json` left over from a prior gardend
+/// process before spawning a new one. gardend never deletes its own manifest
+/// on exit, so restarting sophia-mcp against a reused profile dir otherwise
+/// finds the dead process's manifest still on disk — `wait_for_manifest`
+/// would read it immediately (the file already exists), latch onto its
+/// now-dead port, and time out in `wait_for_health` waiting for a server
+/// that will never answer. An absent file is not an error (the common case:
+/// a fresh profile dir, or a profile whose manifest was already cleaned up).
+fn clear_stale_manifest(manifest_path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(manifest_path) {
+        Ok(()) => {
+            tracing::debug!(
+                path = %manifest_path.display(),
+                "removed stale loopback manifest from a prior run before spawning"
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "removing stale loopback manifest {}",
+                manifest_path.display()
+            )
+        }),
+    }
+}
+
+/// Wait for gardend to write its loopback manifest. `expected_pid`, when
+/// `Some` (the normal case: the pid of the child we just spawned), gates
+/// acceptance: a manifest whose own `pid` field is present and does NOT
+/// match is treated as not-yet-ours and polling continues, rather than
+/// trusted — belt-and-suspenders on top of [`clear_stale_manifest`] in case
+/// some other write still raced onto this path. A manifest with no `pid`
+/// field, or a `None` `expected_pid` (e.g. a caller that never spawned a
+/// child), skips the gate entirely and is accepted as before.
+async fn wait_for_manifest(
+    path: &Path,
+    timeout: Duration,
+    expected_pid: Option<u32>,
+) -> anyhow::Result<LoopbackManifest> {
     let deadline = Instant::now() + timeout;
     loop {
         if path.exists() {
             match std::fs::read_to_string(path) {
                 Ok(body) => match serde_json::from_str::<LoopbackManifest>(&body) {
-                    Ok(m) => return Ok(m),
+                    Ok(m) => match (m.pid, expected_pid) {
+                        (Some(got), Some(want)) if got != want => {
+                            tracing::debug!(
+                                manifest_pid = got,
+                                expected_pid = want,
+                                "manifest present but pid mismatch — not ours yet, still waiting"
+                            );
+                        }
+                        _ => return Ok(m),
+                    },
                     Err(e) => tracing::debug!("manifest not yet parseable: {e}"),
                 },
                 Err(e) => tracing::debug!("manifest not yet readable: {e}"),
@@ -461,5 +534,88 @@ mod tests {
         let manifest: LoopbackManifest =
             serde_json::from_str(json).expect("legacy manifest with `token` must still parse");
         assert_eq!(manifest.token.as_deref(), Some("abc123"));
+    }
+
+    // ---- restart bug: stale loopback.json must not survive a fresh spawn ----
+    //
+    // Found by Worker E's context-free clean-clone evaluation: restarting
+    // `sophia-mcp --backend local` against a profile dir that already has a
+    // loopback.json from a prior (now-dead) run failed every time, because
+    // wait_for_manifest had no freshness check and latched onto the dead
+    // process's port. See demi/rounds/2026-09-22-oss-remediation/receipts/
+    // worker-C1.md for the real end-to-end repro transcripts (a genuine
+    // gardend binary, restarted twice against the same profile dir).
+
+    #[test]
+    fn clear_stale_manifest_removes_a_pre_existing_manifest() {
+        let scratch = ScratchDir::new("clear-stale-present");
+        let manifest_path = scratch.touch("loopback.json");
+        std::fs::write(
+            &manifest_path,
+            br#"{"port":9999,"apiUrl":"http://127.0.0.1:9999","mcpUrl":"http://127.0.0.1:9999/mcp","pid":424242}"#,
+        )
+        .expect("write a stale manifest fixture");
+        assert!(
+            manifest_path.exists(),
+            "fixture setup: file must exist first"
+        );
+
+        clear_stale_manifest(&manifest_path)
+            .expect("clearing a pre-existing manifest must succeed");
+
+        assert!(
+            !manifest_path.exists(),
+            "a stale manifest from a prior run must be removed before the next spawn"
+        );
+    }
+
+    #[test]
+    fn clear_stale_manifest_is_a_noop_when_nothing_is_there() {
+        let scratch = ScratchDir::new("clear-stale-absent");
+        let manifest_path = scratch.path().join("loopback.json");
+        assert!(
+            !manifest_path.exists(),
+            "fixture setup: nothing should be there yet"
+        );
+
+        clear_stale_manifest(&manifest_path)
+            .expect("clearing an absent manifest must succeed (no-op), not error");
+    }
+
+    #[tokio::test]
+    async fn wait_for_manifest_ignores_a_pid_mismatched_manifest_and_waits_for_the_matching_one() {
+        let scratch = ScratchDir::new("pid-gate");
+        let manifest_path = scratch.path().join("loopback.json");
+        // A stale manifest from some other (dead) process, already on disk —
+        // simulates exactly what a reused profile dir looks like pre-fix.
+        std::fs::write(
+            &manifest_path,
+            br#"{"port":9,"apiUrl":"http://127.0.0.1:9","mcpUrl":"http://127.0.0.1:9/mcp","pid":999999}"#,
+        )
+        .expect("write a stale manifest fixture");
+
+        let expected_pid = 424242u32;
+        let bg_path = manifest_path.clone();
+        tokio::spawn(async move {
+            // Simulate the freshly-spawned child taking a beat to boot and
+            // write its OWN manifest, matching our pid, to the same path.
+            sleep(Duration::from_millis(120)).await;
+            std::fs::write(
+                &bg_path,
+                format!(
+                    r#"{{"port":18086,"apiUrl":"http://127.0.0.1:18086","mcpUrl":"http://127.0.0.1:18086/mcp","pid":{expected_pid}}}"#
+                ),
+            )
+            .expect("write the matching manifest");
+        });
+
+        let manifest =
+            wait_for_manifest(&manifest_path, Duration::from_secs(2), Some(expected_pid))
+                .await
+                .expect("must eventually observe the matching manifest, not the stale one");
+        assert_eq!(
+            manifest.port, 18086,
+            "must have waited past the pid-mismatched stale manifest (port 9) for the real one"
+        );
     }
 }
