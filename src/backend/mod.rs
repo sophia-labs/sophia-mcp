@@ -26,6 +26,8 @@ use serde_json::Value;
 
 mod remote;
 pub use remote::{AuthHeaders, RemoteHttp};
+mod scoped;
+pub use scoped::ScopedMcp;
 
 pub mod gateway;
 pub use gateway::{GatewayBackend, GatewayOptions};

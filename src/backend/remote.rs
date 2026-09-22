@@ -111,15 +111,30 @@ pub(crate) async fn post_rpc(
     method: &str,
     params: Value,
 ) -> anyhow::Result<HttpReply> {
+    post_rpc_with_version(client, url, method, params, None).await
+}
+
+pub(crate) async fn post_rpc_with_version(
+    client: &reqwest::Client,
+    url: &str,
+    method: &str,
+    params: Value,
+    protocol_version: Option<&str>,
+) -> anyhow::Result<HttpReply> {
     let req = JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
         id: Some(json!(uuid::Uuid::new_v4().to_string())),
         method: method.to_string(),
         params,
     };
-    let http = client
+    let mut http = client
         .post(url)
-        .json(&req)
+        .header("accept", "application/json, text/event-stream")
+        .json(&req);
+    if let Some(version) = protocol_version {
+        http = http.header("mcp-protocol-version", version);
+    }
+    let http = http
         .send()
         .await
         .with_context(|| format!("POST {url} ({method})"))?;

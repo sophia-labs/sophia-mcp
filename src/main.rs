@@ -71,6 +71,12 @@ async fn build_backend(cli: &Cli) -> anyhow::Result<Arc<dyn Backend>> {
         // Remote endpoints (gateway / hosted) don't enforce a loopback Origin.
         origin: None,
     };
+    if cli.token.as_deref().is_some_and(|token| token.starts_with("sph_ak")) {
+        return Ok(Arc::new(backend::ScopedMcp::new(
+            &cli.backend, cli.owner.as_deref(), cli.graph.as_deref(), auth,
+            Duration::from_secs(cli.activation_timeout.max(1)),
+        )?));
+    }
     if let (Some(owner), Some(graph)) = (cli.owner.as_deref(), cli.graph.as_deref()) {
         let opts = GatewayOptions {
             activation_timeout: Duration::from_secs(cli.activation_timeout),
