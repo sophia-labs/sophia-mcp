@@ -43,6 +43,13 @@ struct LoopbackManifest {
     port: u16,
     api_url: String,
     mcp_url: String,
+    // Deliberately unused in production: `start()` always prefers the
+    // self-minted token (see the `bearer` field below) and never reads this
+    // one back. Kept only so deserialization keeps accepting a manifest that
+    // still carries `token` (today) or has dropped it (Garden's secret-free
+    // future) — exercised directly by `tests::manifest_without_token_field_parses`
+    // and `tests::legacy_manifest_with_token_field_still_parses`.
+    #[allow(dead_code)]
     token: Option<String>,
 }
 
@@ -125,13 +132,16 @@ impl LocalGarden {
         let remote = RemoteHttp::new(
             mcp_url.clone(),
             AuthHeaders {
-                // Prefer the token we minted and handed gardend via
-                // GARDEN_LOOPBACK_TOKEN above — we already know it, no need to
-                // trust the disk manifest for it. Fall back to manifest.token
-                // only if it's ever present and our own token were somehow
-                // unavailable; this keeps the auth path alive on the day
-                // Garden's manifest DTO drops `token` entirely.
-                bearer: Some(token.clone()).or_else(|| manifest.token.clone()),
+                // Use the token we minted and handed gardend via
+                // GARDEN_LOOPBACK_TOKEN above — we already know it, so we never
+                // need to trust the disk manifest for it. manifest.token is
+                // deliberately ignored here, not consulted as a fallback: we
+                // always have our own token by construction, so a fallback
+                // read would be unreachable code that misleads a reader into
+                // thinking manifest.token might still be used. It stays
+                // `Option` purely so deserialization doesn't fail on the day
+                // Garden's manifest DTO drops the field entirely.
+                bearer: Some(token.clone()),
                 // gardend's origin_ok requires a loopback / null Origin.
                 origin: Some("http://127.0.0.1".to_string()),
                 ..Default::default()

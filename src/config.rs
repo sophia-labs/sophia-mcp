@@ -88,8 +88,10 @@ pub struct Cli {
     pub profile_dir: Option<PathBuf>,
 
     /// Path to the `gardend` binary for the LOCAL backend. If unset, sophia-mcp looks
-    /// for `gardend` on PATH and at `../garden/src-tauri/target/release/gardend`
-    /// relative to the sophia-mcp binary.
+    /// for a `gardend` next to its own binary, then at the sibling garden checkout's
+    /// headless example target — `../garden/src-tauri/target/release/examples/gardend`
+    /// relative to the current directory (falling back to the `debug` variant) —
+    /// then finally on `PATH` (see `backend::local::resolve_gardend_bin_from`).
     #[arg(long, env = "SOPHIA_MCP_GARDEN_BIN")]
     pub garden_bin: Option<PathBuf>,
 
