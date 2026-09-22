@@ -51,25 +51,35 @@ hardcoded in sophia-mcp**.
 
 ### Prerequisite: the `gardend` binary
 
-The LOCAL backend runs the stock, OSS **garden** cell binary. sophia-mcp finds it via,
-in order:
+The LOCAL backend runs garden's headless **gardend** cell binary. Garden is
+**source-available**, not OSS — it's licensed under the PolyForm Noncommercial
+License 1.0.0 (see garden's own `LICENSE` / `NOTICE.md`); non-commercial use,
+modification, and redistribution are permitted, commercial use requires a
+separate agreement with the maintainers. sophia-mcp finds the binary via, in
+order:
 
 1. `--garden-bin <path>` (or `SOPHIA_MCP_GARDEN_BIN`),
 2. a `gardend` next to the `sophia-mcp` binary,
-3. `../garden/src-tauri/target/release/gardend` (sibling checkout),
+3. the sibling garden checkout's headless build —
+   `../garden/src-tauri/target/release/examples/gardend`, falling back to the
+   `debug` variant,
 4. `gardend` on `PATH`.
 
-Build it once from the garden repo (it's a normal headless Cargo target):
+Build it once from the garden repo. `gardend` is a cargo **example**, not a
+`[[bin]]` — garden's desktop Tauri bundler copies every manifest `[[bin]]`
+into the `.app`, so gardend is deliberately kept out of `[[bin]]` and lives
+under `examples/` instead (see garden's `build-gardend-headless.sh`):
 
 ```bash
 # in the garden checkout:
-cargo build --release --no-default-features --features headless --bin gardend
+cargo build --release --no-default-features --features headless --example gardend
+# binary lands at target/release/examples/gardend
 ```
 
 Then point sophia-mcp at it if it isn't already discoverable:
 
 ```bash
-sophia-mcp --garden-bin /path/to/garden/src-tauri/target/release/gardend
+sophia-mcp --garden-bin /path/to/garden/src-tauri/target/release/examples/gardend
 ```
 
 > **Why a subprocess, not a library link?** garden's in-process headless
@@ -364,9 +374,12 @@ tests/
 cargo test
 ```
 
-72 tests: URL resolution, auth-header construction, catalog merging (prefixing,
+81 tests: URL resolution, auth-header construction, catalog merging (prefixing,
 pagination), graph-argument parsing/normalization, sub-MCP prefix parsing/validation,
-the stdio dispatch (initialize backfill, tools passthrough, `structuredContent`
+`gardend` discovery resolution order (explicit `--garden-bin` wins and errors if
+missing, exe-adjacent, sibling-checkout `examples/` release then debug, `PATH`
+fallback last) and loopback-manifest parsing (with and without the now-optional
+`token` field), the stdio dispatch (initialize backfill, tools passthrough, `structuredContent`
 normalization, notification handling, unknown method / unknown tool),
 a wiremock-backed end-to-end of the direct remote proxy, a wiremock gateway
 covering the union catalog, `graph_id` routing (listed, unlisted, revoked-on-refresh,
@@ -384,4 +397,10 @@ bearer tokens never crossing to the primary or another sub.
 
 ## License
 
-MIT OR Apache-2.0.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
