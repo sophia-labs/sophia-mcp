@@ -5,6 +5,7 @@
 //! prefixes refused at config parse. Style follows `tests/gateway_multigraph.rs`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use sophia_mcp::backend::{AuthHeaders, Backend, ComposedBackend, RemoteHttp};
@@ -14,14 +15,24 @@ use sophia_mcp::server::handle_request;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+fn test_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
 fn rpc_ok(result: Value) -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_json(json!({ "jsonrpc": "2.0", "id": "x", "result": result }))
+    ResponseTemplate::new(200)
+        .set_body_json(json!({ "jsonrpc": "2.0", "id": "x", "result": result }))
 }
 
 fn primary_client(server: &MockServer) -> Arc<dyn Backend> {
     Arc::new(
-        RemoteHttp::new(RemoteHttp::resolve_mcp_url(&server.uri(), None), AuthHeaders::default())
-            .unwrap(),
+        RemoteHttp::new(
+            RemoteHttp::resolve_mcp_url(&server.uri(), None),
+            AuthHeaders::default(),
+            test_timeout(),
+            false,
+        )
+        .unwrap(),
     )
 }
 
@@ -33,6 +44,8 @@ fn primary_client_with_token(server: &MockServer, token: &str) -> Arc<dyn Backen
                 bearer: Some(token.to_string()),
                 ..Default::default()
             },
+            test_timeout(),
+            false,
         )
         .unwrap(),
     )
@@ -60,7 +73,9 @@ async fn client_call(
         method: rpc::TOOLS_CALL.into(),
         params: json!({ "name": name, "arguments": arguments }),
     };
-    handle_request(backend, req).await.expect("a request gets a reply")
+    handle_request(backend, req)
+        .await
+        .expect("a request gets a reply")
 }
 
 // --------------------------------------------------------------- (1) merged catalog
@@ -94,6 +109,8 @@ async fn merged_tools_list_carries_primary_tools_plus_prefixed_sub_tools_verbati
     let composed = ComposedBackend::compose(
         primary_client(&primary),
         vec![sub_spec("layout", &sub, None)],
+        test_timeout(),
+        false,
     )
     .await
     .unwrap();
@@ -103,11 +120,20 @@ async fn merged_tools_list_carries_primary_tools_plus_prefixed_sub_tools_verbati
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names, vec!["read_document", "layout_world", "layout_moves"]);
 
-    let world = tools.iter().find(|t| t["name"] == json!("layout_world")).unwrap();
+    let world = tools
+        .iter()
+        .find(|t| t["name"] == json!("layout_world"))
+        .unwrap();
     assert_eq!(world["description"], json!("the page in words, right now"));
-    assert_eq!(world["inputSchema"]["properties"]["graphId"]["type"], json!("string"));
+    assert_eq!(
+        world["inputSchema"]["properties"]["graphId"]["type"],
+        json!("string")
+    );
 
-    let read = tools.iter().find(|t| t["name"] == json!("read_document")).unwrap();
+    let read = tools
+        .iter()
+        .find(|t| t["name"] == json!("read_document"))
+        .unwrap();
     assert_eq!(read["description"], json!("reads a document"));
 }
 
@@ -152,6 +178,8 @@ async fn tools_call_layout_moves_reaches_the_sub_as_moves_untouched_and_is_norma
     let composed = ComposedBackend::compose(
         primary_client(&primary),
         vec![sub_spec("layout", &sub, None)],
+        test_timeout(),
+        false,
     )
     .await
     .unwrap();
@@ -190,7 +218,9 @@ async fn tools_call_read_document_still_reaches_the_primary_not_the_sub() {
             "method": "tools/call",
             "params": { "name": "read_document", "arguments": { "id": "doc-1" } }
         })))
-        .respond_with(rpc_ok(json!({ "content": [], "structuredContent": { "id": "doc-1", "title": "t" } })))
+        .respond_with(rpc_ok(
+            json!({ "content": [], "structuredContent": { "id": "doc-1", "title": "t" } }),
+        ))
         .expect(1)
         .mount(&primary)
         .await;
@@ -206,6 +236,8 @@ async fn tools_call_read_document_still_reaches_the_primary_not_the_sub() {
     let composed = ComposedBackend::compose(
         primary_client(&primary),
         vec![sub_spec("layout", &sub, None)],
+        test_timeout(),
+        false,
     )
     .await
     .unwrap();
@@ -218,7 +250,9 @@ async fn tools_call_read_document_still_reaches_the_primary_not_the_sub() {
 
     let sub_requests = sub.received_requests().await.unwrap();
     assert!(
-        sub_requests.iter().all(|r| !String::from_utf8_lossy(&r.body).contains("tools/call")),
+        sub_requests
+            .iter()
+            .all(|r| !String::from_utf8_lossy(&r.body).contains("tools/call")),
         "the sub must never see a call meant for the primary: {sub_requests:?}"
     );
 }
@@ -247,6 +281,8 @@ async fn a_sub_whose_tools_list_500s_at_start_is_skipped_and_layout_x_is_method_
     let composed = ComposedBackend::compose(
         primary_client(&primary),
         vec![sub_spec("layout", &sub, None)],
+        test_timeout(),
+        false,
     )
     .await
     .expect("a down sub must not fail composition");
@@ -287,7 +323,9 @@ async fn a_sub_bearer_token_is_sent_to_the_sub_and_never_to_the_primary() {
         .and(path("/mcp"))
         .and(header("authorization", "Bearer primary-token"))
         .and(body_partial_json(json!({ "method": "tools/call" })))
-        .respond_with(rpc_ok(json!({ "content": [], "structuredContent": { "who": "primary" } })))
+        .respond_with(rpc_ok(
+            json!({ "content": [], "structuredContent": { "who": "primary" } }),
+        ))
         .mount(&primary)
         .await;
 
@@ -302,8 +340,12 @@ async fn a_sub_bearer_token_is_sent_to_the_sub_and_never_to_the_primary() {
     Mock::given(method("POST"))
         .and(path("/mcp"))
         .and(header("authorization", "Bearer sub-token"))
-        .and(body_partial_json(json!({ "method": "tools/call", "params": { "name": "world" } })))
-        .respond_with(rpc_ok(json!({ "content": [], "structuredContent": { "who": "sub" } })))
+        .and(body_partial_json(
+            json!({ "method": "tools/call", "params": { "name": "world" } }),
+        ))
+        .respond_with(rpc_ok(
+            json!({ "content": [], "structuredContent": { "who": "sub" } }),
+        ))
         .expect(1)
         .mount(&sub)
         .await;
@@ -311,6 +353,8 @@ async fn a_sub_bearer_token_is_sent_to_the_sub_and_never_to_the_primary() {
     let composed = ComposedBackend::compose(
         primary_client_with_token(&primary, "primary-token"),
         vec![sub_spec("layout", &sub, Some("sub-token"))],
+        test_timeout(),
+        false,
     )
     .await
     .unwrap();
@@ -356,7 +400,10 @@ async fn a_sub_bearer_token_is_sent_to_the_sub_and_never_to_the_primary() {
 
 #[test]
 fn an_invalid_prefix_is_refused_at_config_parse() {
-    for bad in ["Layout=http://127.0.0.1:5199/mcp", "1x=http://127.0.0.1:5199/mcp"] {
+    for bad in [
+        "Layout=http://127.0.0.1:5199/mcp",
+        "1x=http://127.0.0.1:5199/mcp",
+    ] {
         let err = parse_sub_specs(&[bad.to_string()], &[]).unwrap_err();
         assert!(format!("{err}").contains("invalid"), "{bad}: {err}");
     }

@@ -1,5 +1,7 @@
 # sophia-mcp
 
+[![CI](https://github.com/sophia-labs/sophia-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/sophia-labs/sophia-mcp/actions/workflows/ci.yml)
+
 A tiny **stdio MCP server** that lets Claude Code (and any other MCP client) talk
 to a **Mnemosyne / garden** knowledge-graph backend.
 
@@ -103,14 +105,21 @@ sophia-mcp --garden-bin /path/to/garden/src-tauri/target/release/examples/garden
 ## Point at an existing backend (REMOTE)
 
 ```bash
-# A platform-next gateway, naming the canonical owner tuple:
+# A platform-next gateway, naming the canonical owner tuple. Prefer the env
+# var over --token: a token passed on the command line is visible to anyone
+# who can list this machine's processes for as long as sophia-mcp runs.
+SOPHIA_MCP_TOKEN="$PN_SERVICE_TOKEN" \
 sophia-mcp --backend https://gateway.example.com \
      --owner user:$MY_COGNITO_SUB --graph my-graph \
-     --token "$PN_SERVICE_TOKEN" --on-behalf-of "$MY_COGNITO_SUB"
+     --on-behalf-of "$MY_COGNITO_SUB"
 
 # …or an explicit Garden loopback:
-sophia-mcp --backend http://127.0.0.1:8086/mcp --token "$LOOPBACK_TOKEN"
+SOPHIA_MCP_TOKEN="$LOOPBACK_TOKEN" sophia-mcp --backend http://127.0.0.1:8086/mcp
 ```
+
+(`--token` still works, for one-off local testing or an environment that
+already isolates argv, but `SOPHIA_MCP_TOKEN` is the one to reach for by
+default.)
 
 URL resolution:
 
@@ -243,10 +252,14 @@ yet answer MCP), and waking a dormant cell takes minutes. sophia-mcp therefore:
    retryable `5xx` at the connect-time kick is logged, not fatal
    (`graph_repair_required` is typed non-retryable and surfaced at once).
 
-> **Follow-up, not fixed here:** the direct `--backend <url>/mcp` path
-> (`RemoteHttp::rpc`, also used by the LOCAL backend) has no per-request
-> ceiling yet — only the 10 s connect timeout and no-redirect policy from
-> `build_client` apply. `--request-timeout` bounds the gateway backend only.
+`--request-timeout` now bounds every backend alike (LOCAL's proxy to
+gardend's loopback, a direct `--backend <url>/mcp`, every sub-MCP, and the
+gateway) — set as the reqwest client's own total-request timeout
+(connect + send + full response read) at `build_client`, not just the
+gateway's manual activation-wait bookkeeping. Every HTTP response body is
+also read incrementally and capped at 10 MiB (`remote::MAX_RESPONSE_BYTES`),
+so an oversized or slow-drip response can't grow unbounded memory before
+sophia-mcp notices and aborts the read.
 
 Progress is logged to stderr only (`SOPHIA_MCP_LOG=info`).
 
@@ -259,15 +272,16 @@ Every flag has an env var twin.
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `--backend` | `SOPHIA_MCP_BACKEND` | `local` | `local`, or a backend URL |
-| `--token` | `SOPHIA_MCP_TOKEN` | — | bearer token for REMOTE |
+| `--token` | `SOPHIA_MCP_TOKEN` | — | bearer token for REMOTE. **Prefer the env var** — a token on the command line is visible to anyone who can list this machine's processes for as long as sophia-mcp runs |
 | `--on-behalf-of` | `SOPHIA_MCP_ON_BEHALF_OF` | — | gateway service-auth subject |
 | `--user-id` | `SOPHIA_MCP_USER_ID` | — | `X-User-ID` side-channel |
 | `--owner` | `SOPHIA_MCP_OWNER` | — | stable typed owner required for cloud-2 |
 | `--graph` | `SOPHIA_MCP_GRAPH` | — | local graph id required for cloud-2 (the *bound* graph) |
-| `--activation-timeout` | `SOPHIA_MCP_ACTIVATION_TIMEOUT` | `300` | seconds to wait for a cell to become routable |
-| `--activation-poll` | `SOPHIA_MCP_ACTIVATION_POLL` | `2` | seconds between activation polls; base of the re-probe backoff |
-| `--request-timeout` | `SOPHIA_MCP_REQUEST_TIMEOUT` | `120` | per-request ceiling for any single HTTP request to the gateway |
-| `--unified-mcp-fallback` | `SOPHIA_MCP_UNIFIED_MCP_FALLBACK` | `false` | also try `{base}/mcp` for control tools when `/control/mcp` is 404 |
+| `--allow-insecure-http` | `SOPHIA_MCP_ALLOW_INSECURE_HTTP` | `false` | allow sending a bearer over plain `http://` to a non-loopback host (loopback is always allowed regardless) |
+| `--activation-timeout` | `SOPHIA_MCP_ACTIVATION_TIMEOUT` | `300` | seconds to wait for a cell to become routable (gateway-only) |
+| `--activation-poll` | `SOPHIA_MCP_ACTIVATION_POLL` | `2` | seconds between activation polls; base of the re-probe backoff (gateway-only) |
+| `--request-timeout` | `SOPHIA_MCP_REQUEST_TIMEOUT` | `120` | per-request ceiling (connect + send + full response read) for any single HTTP request — applies to every backend, not just the gateway |
+| `--unified-mcp-fallback` | `SOPHIA_MCP_UNIFIED_MCP_FALLBACK` | `false` | also try `{base}/mcp` for control tools when `/control/mcp` is 404 (gateway-only) |
 | `--profile-dir` | `SOPHIA_MCP_PROFILE_DIR` | `~/.sophia-mcp/profile` | LOCAL data dir |
 | `--garden-bin` | `SOPHIA_MCP_GARDEN_BIN` | auto-discover | LOCAL `gardend` path |
 | `--local-port` | `SOPHIA_MCP_LOCAL_PORT` | `0` (OS-assigned) | LOCAL loopback port |
@@ -350,6 +364,7 @@ Claude Code ──stdio JSON-RPC──▶ sophia-mcp ──HTTP JSON-RPC──�
   gateway: cell ∪ control, see *Multi-graph*); `tools/call` forwards
   `{name, arguments}` and returns the result envelope.
 * **`structuredContent` is always an object at the client:** MCP requires it, and Claude Code rejects anything else; when an upstream answers with an array (the gateway control plane's `list_graphs` does) sophia-mcp wraps it as `{"items": [...]}` (a scalar as `{"value": …}`), leaving objects and `content` untouched — logged at `debug` once per tool.
+* **Error messages to the client are bounded and redacted; full detail goes to stderr.** A failed call's full `anyhow` chain is always logged (`tracing::error!`) for operators; the JSON-RPC error message the MCP client actually sees is capped at 2 KB, and any raw upstream HTTP body embedded along the way is separately capped at 500 bytes with an explicit truncation marker before it's ever interpolated into a message — never shipped whole to an untrusted-by-default client. This is a real error-contract behavior change from 0.2.x, where the full chain (including full upstream bodies) went straight to the client — one reason this release is 0.3.0.
 
 ### Layout
 
@@ -381,13 +396,18 @@ tests/
 cargo test
 ```
 
-84 tests: URL resolution, auth-header construction, catalog merging (prefixing,
+101 tests: URL resolution, auth-header construction, catalog merging (prefixing,
 pagination), graph-argument parsing/normalization, sub-MCP prefix parsing/validation,
 `gardend` discovery resolution order (explicit `--garden-bin` wins and errors if
 missing, exe-adjacent, sibling-checkout `examples/` release then debug, `PATH`
 fallback last), loopback-manifest parsing (with and without the now-optional
-`token` field), and restart safety (a stale `loopback.json` from a prior run is
-cleared before spawning, and a pid-mismatched manifest is never trusted), the
+`token` field), restart safety (a stale `loopback.json` from a prior run is
+cleared before spawning, and a pid-mismatched manifest is never trusted),
+client-facing error redaction (a huge or secret-bearing upstream/backend error
+never reaches the MCP client unbounded, at both the per-site body redaction
+and the final client-message cap), the plain-`http://`-plus-bearer refusal
+(loopback always allowed, `--allow-insecure-http` overrides elsewhere), and
+the response-size cap enforced during the read rather than after, the
 stdio dispatch (initialize backfill, tools passthrough, `structuredContent`
 normalization, notification handling, unknown method / unknown tool),
 a wiremock-backed end-to-end of the direct remote proxy, a wiremock gateway
