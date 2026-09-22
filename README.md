@@ -389,8 +389,11 @@ MIT OR Apache-2.0.
 ### Scoped Sirin API keys (0.2.2)
 
 In Garden Settings → API & MCP, create a key with **MCP Read**, optionally
-**MCP Write**, and select its workspaces. Expand **Connect an MCP client** on
-that key to copy a workspace URL. Save the secret when it is first shown.
+**MCP Write**, and choose **Selected workspaces** or **All my workspaces**.
+Global keys cover current, future and shared workspaces you can access.
+Expand **Connect an MCP client** on that key to copy a workspace URL. Save the
+secret when it is first shown. The same global key works with each workspace
+URL; each connection still addresses one workspace.
 
 For a stdio client, configure:
 
@@ -414,7 +417,7 @@ supply `--on-behalf-of` or `--user-id` with an API key.
 
 API keys connect directly to the selected workspace. Account/control tools are
 not exposed. Each call checks the key's expiry, revocation, exact workspace
-allowlist and your current access. MCP Read caps calls at Viewer; MCP Write
+selection (or explicit global coverage) and your current access. MCP Read caps calls at Viewer; MCP Write
 caps them at Editor. HTTP-only keys do not gain MCP access.
 
 A sleeping workspace is started on the first RPC. The client waits within
