@@ -7,20 +7,40 @@
 //! stay clean.
 
 use std::collections::HashSet;
+use std::io::BufRead;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 
 use crate::backend::{Backend, ToolNotFound};
 use crate::mcp::{self, method, JsonRpcRequest, JsonRpcResponse};
 
 pub async fn serve_stdio(backend: Arc<dyn Backend>) -> anyhow::Result<()> {
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin).lines();
+    // Tokio's stdio reader uses a blocking runtime thread. Canceling a pending
+    // read on SIGTERM can keep that thread (and therefore the runtime) alive
+    // indefinitely. A detached OS thread sends complete lines to the async
+    // server; dropping the receiver on shutdown lets the process exit while
+    // a client still holds stdin open.
+    let (sender, mut reader) = tokio::sync::mpsc::channel::<String>(32);
+    std::thread::Builder::new()
+        .name("sophia-mcp-stdin".to_owned())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                match line {
+                    Ok(line) => {
+                        if sender.blocking_send(line).is_err() {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        })?;
     let mut stdout = tokio::io::stdout();
 
-    while let Some(line) = reader.next_line().await? {
+    while let Some(line) = reader.recv().await {
         let line = line.trim();
         if line.is_empty() {
             continue;

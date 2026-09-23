@@ -54,8 +54,31 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!("sophia-mcp proxy ready; serving MCP over stdio");
-    server::serve_stdio(backend).await?;
+    serve_until_shutdown(backend).await?;
     Ok(())
+}
+
+/// MCP clients commonly terminate stdio servers with SIGTERM rather than
+/// closing stdin. Exit through Rust so LocalGarden's child handle is dropped
+/// and kill_on_drop stops gardend before the next proxy opens the profile.
+async fn serve_until_shutdown(backend: Arc<dyn Backend>) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = server::serve_stdio(backend) => result,
+            result = tokio::signal::ctrl_c() => result.map_err(Into::into),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            result = server::serve_stdio(backend) => result,
+            result = tokio::signal::ctrl_c() => result.map_err(Into::into),
+        }
+    }
 }
 
 async fn build_backend(cli: &Cli) -> anyhow::Result<Arc<dyn Backend>> {

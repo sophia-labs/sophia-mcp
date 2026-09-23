@@ -57,6 +57,7 @@ a fresh `gardend` cleanly, with no manual cleanup step. sophia-mcp clears any
 `loopback.json` left over from the prior run before spawning, so it can only
 ever observe the manifest the new `gardend` writes — never a stale one
 pointing at a now-dead port from the process that just exited.
+Closing stdin, SIGINT, and SIGTERM all release the local child before exit.
 
 ### Prerequisite: the `gardend` binary
 

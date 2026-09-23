@@ -140,3 +140,39 @@ async fn stdio_client_can_switch_modes_and_refresh_its_tool_catalog() {
     assert!(!after_names.contains(&"read_document"));
     child.kill().await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_exits_cleanly_while_client_keeps_stdin_open() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method":"initialize"})))
+        .respond_with(rpc(json!({"capabilities":{"tools":{}}})))
+        .mount(&server)
+        .await;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sophia-mcp"))
+        .args(["--backend", &format!("{}/mcp", server.uri())])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+    send(&mut stdin, 1, "initialize", json!({})).await;
+    assert!(receive(&mut stdout).await["result"].is_object());
+    let pid = child.id().unwrap().to_string();
+    assert!(Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .await
+        .unwrap()
+        .success());
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("SIGTERM must cancel an open stdin read")
+        .unwrap();
+    assert_eq!(status.code(), Some(0));
+}
