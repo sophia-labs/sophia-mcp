@@ -101,6 +101,7 @@ impl ComposedBackend {
                 mcp_url.clone(),
                 AuthHeaders {
                     bearer: spec.token.clone(),
+                    on_behalf_of: spec.on_behalf_of.clone(),
                     ..Default::default()
                 },
                 request_timeout,

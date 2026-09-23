@@ -171,6 +171,17 @@ pub struct Cli {
         value_delimiter = ','
     )]
     pub sub_tokens: Vec<String>,
+
+    /// Acting user for a gateway-backed sub-MCP: `<prefix>=<subject>`. Sent as
+    /// `x-pn-on-behalf-of` only to that sub, alongside its own bearer token.
+    /// Do not infer this from the primary backend: sub endpoints have separate
+    /// credentials and may be unrelated services.
+    #[arg(
+        long = "sub-on-behalf-of",
+        env = "SOPHIA_MCP_SUB_ON_BEHALF_OF",
+        value_delimiter = ','
+    )]
+    pub sub_on_behalf_of: Vec<String>,
 }
 
 /// Non-serving subcommands.
@@ -206,7 +217,40 @@ impl Cli {
     /// no `--sub` was given — the common case, where `ComposedBackend` is
     /// never built at all.
     pub fn resolved_subs(&self) -> anyhow::Result<Vec<SubSpec>> {
-        parse_sub_specs(&self.subs, &self.sub_tokens)
+        let mut specs = parse_sub_specs(&self.subs, &self.sub_tokens)?;
+        let mut subjects = std::collections::HashMap::new();
+        for raw in &self.sub_on_behalf_of {
+            let (prefix, subject) = raw
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--sub-on-behalf-of must be prefix=subject"))?;
+            if !valid_prefix(prefix)
+                || subject.is_empty()
+                || subject.len() > 192
+                || !subject
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.@:-".contains(&byte))
+            {
+                anyhow::bail!("invalid --sub-on-behalf-of binding");
+            }
+            if subjects.insert(prefix, subject).is_some() {
+                anyhow::bail!("duplicate --sub-on-behalf-of prefix '{prefix}'");
+            }
+        }
+        for spec in &mut specs {
+            spec.on_behalf_of = subjects.get(spec.prefix.as_str()).map(|s| (*s).to_string());
+            if spec.on_behalf_of.is_some() && spec.token.is_none() {
+                anyhow::bail!(
+                    "sub '{}' needs --sub-token with --sub-on-behalf-of",
+                    spec.prefix
+                );
+            }
+        }
+        for prefix in subjects.keys() {
+            if !specs.iter().any(|spec| spec.prefix == *prefix) {
+                anyhow::bail!("--sub-on-behalf-of prefix '{prefix}' has no matching --sub");
+            }
+        }
+        Ok(specs)
     }
 }
 
@@ -217,6 +261,7 @@ pub struct SubSpec {
     pub prefix: String,
     pub url: String,
     pub token: Option<String>,
+    pub on_behalf_of: Option<String>,
 }
 
 /// A bare, single-segment lowercase identifier: `[a-z][a-z0-9]*`. Refuses an
@@ -271,6 +316,7 @@ pub fn parse_sub_specs(subs: &[String], sub_tokens: &[String]) -> anyhow::Result
             prefix: prefix.to_string(),
             url: url.to_string(),
             token: tokens.get(prefix).map(|t| t.to_string()),
+            on_behalf_of: None,
         });
     }
     Ok(specs)
@@ -279,6 +325,7 @@ pub fn parse_sub_specs(subs: &[String], sub_tokens: &[String]) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn parses_valid_subs_and_pairs_matching_tokens() {
@@ -297,11 +344,13 @@ mod tests {
                     prefix: "layout".into(),
                     url: "http://127.0.0.1:5199/mcp".into(),
                     token: Some("secret-token".into()),
+                    on_behalf_of: None,
                 },
                 SubSpec {
                     prefix: "obs2".into(),
                     url: "http://x/mcp".into(),
                     token: None,
+                    on_behalf_of: None,
                 },
             ]
         );
@@ -333,5 +382,41 @@ mod tests {
     #[test]
     fn no_subs_is_the_empty_vec() {
         assert_eq!(parse_sub_specs(&[], &[]).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn sub_gateway_identity_requires_its_own_token() {
+        let cli = super::Cli::try_parse_from([
+            "sophia-mcp",
+            "--sub",
+            "notebooks=https://api.example/o/user:owner/g/notes/notebooks/mcp",
+            "--sub-token",
+            "notebooks=service-secret",
+            "--sub-on-behalf-of",
+            "notebooks=user-sub",
+        ])
+        .unwrap();
+        let specs = cli.resolved_subs().unwrap();
+        assert_eq!(specs[0].on_behalf_of.as_deref(), Some("user-sub"));
+        let missing = super::Cli::try_parse_from([
+            "sophia-mcp",
+            "--sub",
+            "notebooks=https://api.example/mcp",
+            "--sub-on-behalf-of",
+            "notebooks=user-sub",
+        ])
+        .unwrap();
+        assert!(missing.resolved_subs().is_err());
+        let wrong_prefix = super::Cli::try_parse_from([
+            "sophia-mcp",
+            "--sub",
+            "notebooks=https://api.example/mcp",
+            "--sub-token",
+            "notebooks=service-secret",
+            "--sub-on-behalf-of",
+            "other=user-sub",
+        ])
+        .unwrap();
+        assert!(wrong_prefix.resolved_subs().is_err());
     }
 }

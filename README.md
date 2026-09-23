@@ -243,6 +243,10 @@ sophia-mcp --backend local --sub layout=http://127.0.0.1:5199/mcp
   bearer, sent only on that sub's requests — never on the primary backend's, and
   never on another sub's. `prefix` must match `[a-z][a-z0-9]*` (refused at config
   parse otherwise, e.g. `Layout=`, `1x=`).
+  Gateway-backed subs may also set `--sub-on-behalf-of <prefix>=<subject>`
+  (env `SOPHIA_MCP_SUB_ON_BEHALF_OF`). This sends `x-pn-on-behalf-of` only to
+  that sub and requires a matching `--sub-token`; the primary backend's acting
+  user is never silently reused for an unrelated sub.
 * **Resilience.** Each sub is probed with one `tools/list` call when sophia-mcp
   starts. A sub that fails that probe is logged to stderr (prefix + error —
   never the token) and **skipped** for the rest of the process's life: the
@@ -400,6 +404,7 @@ Every flag has an env var twin.
 | `--local-health-timeout` | `SOPHIA_MCP_LOCAL_HEALTH_TIMEOUT` | `30` | seconds to wait for `/health` |
 | `--sub` | `SOPHIA_MCP_SUBS` | — | mount a sub-MCP, `<prefix>=<url>` (repeatable; env is comma-separated) |
 | `--sub-token` | `SOPHIA_MCP_SUB_TOKENS` | — | bearer for one sub, `<prefix>=<token>` (repeatable; env is comma-separated) |
+| `--sub-on-behalf-of` | `SOPHIA_MCP_SUB_ON_BEHALF_OF` | — | gateway acting subject for one sub, `<prefix>=<subject>`; requires that sub's bearer |
 
 Logging goes to **stderr** (stdout is the MCP channel). Set `SOPHIA_MCP_LOG=debug` for
 verbose output.

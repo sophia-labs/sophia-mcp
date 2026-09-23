@@ -56,6 +56,7 @@ fn sub_spec(prefix: &str, server: &MockServer, token: Option<&str>) -> SubSpec {
         prefix: prefix.to_string(),
         url: server.uri(),
         token: token.map(str::to_string),
+        on_behalf_of: None,
     }
 }
 
@@ -394,6 +395,47 @@ async fn a_sub_bearer_token_is_sent_to_the_sub_and_never_to_the_primary() {
             req.headers
         );
     }
+}
+
+#[tokio::test]
+async fn sub_on_behalf_of_is_sent_only_to_its_gateway_sub() {
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(rpc_ok(json!({ "tools": [] })))
+        .mount(&primary)
+        .await;
+    let sub = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(header("authorization", "Bearer gateway-service"))
+        .and(header("x-pn-on-behalf-of", "user-sub-1"))
+        .respond_with(rpc_ok(json!({ "tools": [{ "name": "list" }] })))
+        .mount(&sub)
+        .await;
+    let mut spec = sub_spec("notebooks", &sub, Some("gateway-service"));
+    spec.on_behalf_of = Some("user-sub-1".into());
+    let composed =
+        ComposedBackend::compose(primary_client(&primary), vec![spec], test_timeout(), false)
+            .await
+            .unwrap();
+    assert!(composed.list_tools(json!({})).await.unwrap()["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "notebooks_list"));
+    assert!(sub
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|request| request.headers.get("x-pn-on-behalf-of").unwrap() == "user-sub-1"));
+    assert!(primary
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|request| request.headers.get("x-pn-on-behalf-of").is_none()));
 }
 
 // --------------------------------------------------- (6) invalid prefix at config parse
