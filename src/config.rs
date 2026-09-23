@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 /// Stdio MCP server that proxies to a Mnemosyne/garden backend.
 ///
@@ -15,6 +15,10 @@ use clap::Parser;
 #[derive(Debug, Clone, Parser)]
 #[command(name = "sophia-mcp", version, about, long_about = None)]
 pub struct Cli {
+    /// Optional subcommand. With none, sophia-mcp serves MCP over stdio.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Backend selector. Either the literal `local` (start + proxy to a headless
     /// garden on this machine) or a URL to an existing backend's MCP endpoint
     /// (e.g. `https://gw.example` with `--owner` + `--graph`, or
@@ -156,6 +160,18 @@ pub struct Cli {
         value_delimiter = ','
     )]
     pub sub_tokens: Vec<String>,
+}
+
+/// Non-serving subcommands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum Command {
+    /// Replace this binary with the newest GitHub Release (checksum-verified).
+    /// Set SOPHIA_MCP_UPDATE_URL to use a fork or mirror.
+    Update {
+        /// Only report whether a newer release exists; change nothing.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 impl Cli {

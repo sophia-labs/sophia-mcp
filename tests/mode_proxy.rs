@@ -88,6 +88,7 @@ async fn stdio_client_can_switch_modes_and_refresh_its_tool_catalog() {
             "--agent-id",
             "agent-deadbeef",
         ])
+        .env("SOPHIA_MCP_NO_UPDATE_CHECK", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -153,6 +154,7 @@ async fn sigterm_exits_cleanly_while_client_keeps_stdin_open() {
         .await;
     let mut child = Command::new(env!("CARGO_BIN_EXE_sophia-mcp"))
         .args(["--backend", &format!("{}/mcp", server.uri())])
+        .env("SOPHIA_MCP_NO_UPDATE_CHECK", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

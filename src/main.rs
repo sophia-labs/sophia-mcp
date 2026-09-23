@@ -13,8 +13,9 @@ use sophia_mcp::backend::{
     self, AuthHeaders, Backend, ComposedBackend, GatewayBackend, GatewayOptions, LocalGarden,
     ModeBackend, RemoteHttp,
 };
-use sophia_mcp::config::Cli;
+use sophia_mcp::config::{Cli, Command};
 use sophia_mcp::server;
+use sophia_mcp::update;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -28,6 +29,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Some(Command::Update { check }) = cli.command {
+        return run_update(check).await;
+    }
+    // Non-blocking, at most once a day, stderr only (stdout is the MCP channel).
+    tokio::spawn(async {
+        update::startup_check().await;
+    });
     let sub_specs = cli.resolved_subs().context("parsing --sub / --sub-token")?;
     let mut backend = build_backend(&cli).await?;
     if !sub_specs.is_empty() {
@@ -55,6 +63,28 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("sophia-mcp proxy ready; serving MCP over stdio");
     serve_until_shutdown(backend).await?;
+    Ok(())
+}
+
+/// `sophia-mcp update [--check]`. Not an MCP session, so stdout is free.
+async fn run_update(check_only: bool) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locating the running sophia-mcp binary")?;
+    let base = update::release_base();
+    let current = update::CURRENT_VERSION;
+    match update::run_update(&base, &exe, current, check_only).await? {
+        update::UpdateOutcome::UpToDate { latest } => {
+            println!("sophia-mcp {current} is up to date (latest release: {latest})");
+        }
+        update::UpdateOutcome::Available { latest } => {
+            println!("{}", update::notice(&latest, current));
+        }
+        update::UpdateOutcome::Installed { latest, path } => {
+            println!(
+                "sophia-mcp updated {current} -> {latest} at {} (restart MCP clients to pick it up)",
+                path.display()
+            );
+        }
+    }
     Ok(())
 }
 
