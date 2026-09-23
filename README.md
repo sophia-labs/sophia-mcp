@@ -31,6 +31,38 @@ cargo build --release
 
 Requires a recent stable Rust (edition 2021, rustc ≥ 1.85).
 
+Prebuilt binaries (linux x86_64/aarch64, macOS aarch64/x86_64) are attached to
+each [GitHub Release](https://github.com/sophia-labs/sophia-mcp/releases), with
+a `SHA256SUMS` file:
+
+```bash
+curl -fsSLO https://github.com/sophia-labs/sophia-mcp/releases/latest/download/sophia-mcp-vX.Y.Z-aarch64-apple-darwin.tar.gz
+```
+
+---
+
+## Updating
+
+```bash
+sophia-mcp update --check   # is there a newer release?
+sophia-mcp update           # replace this binary with it
+```
+
+`update` downloads the newest release's tarball for this platform, verifies it
+against the release's `SHA256SUMS`, runs the new binary's `--version` as a
+smoke test, then atomically renames it over the running executable (the
+install directory must be writable). Restart your MCP clients afterwards.
+`SOPHIA_MCP_UPDATE_URL=https://github.com/<fork>/sophia-mcp` points it at a
+fork or mirror. A binary you built from source updates the same way, or just
+`git pull && cargo build --release`.
+
+When serving, sophia-mcp checks for a newer release at most once a day
+(stamp in `~/Library/Caches/sophia-mcp` or `$XDG_CACHE_HOME/sophia-mcp`,
+override with `SOPHIA_MCP_CACHE_DIR`), in the background, and prints one line
+to **stderr** if there is one — never to stdout, which is the MCP channel.
+Set `SOPHIA_MCP_NO_UPDATE_CHECK=1` to turn it off; it is also off whenever `CI`
+is set.
+
 ---
 
 ## Out-of-the-box (LOCAL backend)

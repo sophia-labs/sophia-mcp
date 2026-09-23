@@ -1,0 +1,92 @@
+name: Release
+
+# On a v* tag: build release binaries, then publish a GitHub Release carrying
+# one tar.gz per target, SHA256SUMS, and release.json (the manifest
+# `sophia-mcp update` reads — see src/update.rs).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-14 }
+          - { target: x86_64-apple-darwin, os: macos-14 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Tag matches Cargo.toml version
+        shell: bash
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          [ "$want" = "$have" ] || { echo "tag $GITHUB_REF_NAME != Cargo.toml $have"; exit 1; }
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          name="sophia-mcp-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/sophia-mcp" README.md LICENSE-MIT CHANGELOG.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -rf "dist/$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and manifest
+        working-directory: dist
+        run: |
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          version="${GITHUB_REF_NAME#v}"
+          assets="{}"
+          for f in *.tar.gz; do
+            t="${f#sophia-mcp-${GITHUB_REF_NAME}-}"; t="${t%.tar.gz}"
+            assets="$(jq -c --arg t "$t" --arg f "$f" '. + {($t): $f}' <<<"$assets")"
+          done
+          jq -n --arg v "$version" --argjson a "$assets" \
+            '{name: "sophia-mcp", version: $v, assets: $a}' > release.json
+          cat release.json
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "sophia-mcp $GITHUB_REF_NAME" \
+            --notes "See CHANGELOG.md. Update an installed binary with \`sophia-mcp update\`."
