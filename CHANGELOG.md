@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.1 — 2026-09-23
+
+- **Per-sub acting identity.** `--sub-on-behalf-of <prefix>=<subject>`
+  (env `SOPHIA_MCP_SUB_ON_BEHALF_OF`) sends `x-pn-on-behalf-of` to that one
+  sub-MCP, alongside its own `--sub-token`. It is refused without a matching
+  `--sub` and bearer, and the primary backend's acting user is never reused
+  for a sub. This is what mounts Sirin's hosted notebook MCP
+  (`/o/{owner}/g/{graph}/notebooks/mcp`) as `notebooks_*` tools; graph-defined
+  modes filter those names like any other tool.
+
 ## 0.6.0 — 2026-09-23
 
 - **Declare your agent over MCP.** Every graph-bound session exposes

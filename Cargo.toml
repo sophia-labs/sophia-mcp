@@ -1,6 +1,6 @@
 [package]
 name = "sophia-mcp"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Stdio MCP server that proxies Claude Code (and other MCP clients) to a Mnemosyne/garden backend. Tools are autopopulated from the backend, never hardcoded."
