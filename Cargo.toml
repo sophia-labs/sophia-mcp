@@ -1,6 +1,6 @@
 [package]
 name = "sophia-mcp"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Stdio MCP server that proxies Claude Code (and other MCP clients) to a Mnemosyne/garden backend. Tools are autopopulated from the backend, never hardcoded."
@@ -36,7 +36,7 @@ default = []
 local-garden-lib = []
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "process", "time", "signal", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "process", "time", "signal", "fs", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

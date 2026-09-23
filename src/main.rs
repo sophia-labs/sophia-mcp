@@ -1,7 +1,7 @@
 //! sophia-mcp — a stdio MCP server that proxies Claude Code (and other MCP clients) to
 //! a Mnemosyne/garden backend. Tools are autopopulated from the backend; sophia-mcp
-//! never hardcodes them. Garden owns the tools; sophia-mcp owns who-you-are,
-//! which-graph, and which-backend.
+//! never hardcodes graph tools. Garden owns those tools; sophia-mcp owns
+//! identity, graph routing, and optional process-local mode controls.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +11,7 @@ use clap::Parser;
 
 use sophia_mcp::backend::{
     self, AuthHeaders, Backend, ComposedBackend, GatewayBackend, GatewayOptions, LocalGarden,
-    RemoteHttp,
+    ModeBackend, RemoteHttp,
 };
 use sophia_mcp::config::Cli;
 use sophia_mcp::server;
@@ -44,9 +44,41 @@ async fn main() -> anyhow::Result<()> {
         backend = Arc::new(composed);
     }
 
+    if let Some(agent_id) = cli.agent_id.as_deref() {
+        let graph_id = cli
+            .graph
+            .as_deref()
+            .context("--agent-id requires --graph")?;
+        backend = Arc::new(ModeBackend::new(backend, graph_id, agent_id)?);
+        tracing::info!(agent_id, graph_id, "MCP mode enforcement enabled");
+    }
+
     tracing::info!("sophia-mcp proxy ready; serving MCP over stdio");
-    server::serve_stdio(backend).await?;
+    serve_until_shutdown(backend).await?;
     Ok(())
+}
+
+/// MCP clients commonly terminate stdio servers with SIGTERM rather than
+/// closing stdin. Exit through Rust so LocalGarden's child handle is dropped
+/// and kill_on_drop stops gardend before the next proxy opens the profile.
+async fn serve_until_shutdown(backend: Arc<dyn Backend>) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = server::serve_stdio(backend) => result,
+            result = tokio::signal::ctrl_c() => result.map_err(Into::into),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            result = server::serve_stdio(backend) => result,
+            result = tokio::signal::ctrl_c() => result.map_err(Into::into),
+        }
+    }
 }
 
 async fn build_backend(cli: &Cli) -> anyhow::Result<Arc<dyn Backend>> {

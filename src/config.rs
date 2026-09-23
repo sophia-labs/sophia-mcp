@@ -10,9 +10,8 @@ use clap::Parser;
 
 /// Stdio MCP server that proxies to a Mnemosyne/garden backend.
 ///
-/// Tools are autopopulated from the backend (tools/list + tools/call
-/// passthrough) — sophia-mcp never hardcodes them. Garden owns the tools; sophia-mcp owns
-/// who-you-are, which-graph, and which-backend.
+/// Graph tools are autopopulated from the backend (tools/list + tools/call
+/// passthrough). Sophia MCP also owns optional process-local mode controls.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "sophia-mcp", version, about, long_about = None)]
 pub struct Cli {
@@ -61,6 +60,13 @@ pub struct Cli {
     /// name is never treated as globally unique.
     #[arg(long, env = "SOPHIA_MCP_OWNER")]
     pub owner: Option<String>,
+
+    /// Bind this MCP process to a canonical agt:Agent (`agent-<hex>`) in
+    /// `--graph` and enforce its assigned modes. The proxy starts in the
+    /// agent's default mode; its MCP mode tools can select another assigned
+    /// mode for this process. Requires --graph in local and remote operation.
+    #[arg(long, env = "SOPHIA_MCP_AGENT_ID")]
+    pub agent_id: Option<String>,
 
     /// Allow sending a bearer token (`--token`/`SOPHIA_MCP_TOKEN`, a sub's
     /// `--sub-token`, or the gateway service token) over plain `http://` to a
