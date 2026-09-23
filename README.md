@@ -282,6 +282,9 @@ The agent's `agt:defaultMode` and `agt:mayUseMode` assignments and each
 through the backend's existing `sparql_query` MCP tool. Shrubbery's Modes
 editor writes this RDF; no new Garden route or hosted gateway route is needed.
 This works for local gardend, direct Garden `/mcp`, and the hosted gateway.
+Create the graph, agent, and mode assignments first with a trusted graph writer
+(for example Shrubbery's Modes editor). An empty local profile has no mode
+assignment to select.
 
 With `--agent-id`, three proxy tools are always available:
 
@@ -308,6 +311,8 @@ edits become selectable after a proxy restart. The underlying Garden/gateway
 credential and its ACLs remain the authority ceiling. A credential that can
 edit its own mode RDF can change what a *future* proxy process may select; use
 a separate trusted graph writer when modes need to serve as durable policy.
+Choreograph Sessions have their own launch-time mode pin; changing this MCP
+process's mode does not change an already running Choreograph Session.
 
 ---
 
