@@ -65,12 +65,23 @@ pub struct Cli {
     #[arg(long, env = "SOPHIA_MCP_OWNER")]
     pub owner: Option<String>,
 
-    /// Bind this MCP process to a canonical agt:Agent (`agent-<hex>`) in
-    /// `--graph` and enforce its assigned modes. The proxy starts in the
-    /// agent's default mode; its MCP mode tools can select another assigned
-    /// mode for this process. Requires --graph in local and remote operation.
+    /// Optional preset: declare a canonical agt:Agent (`agent-<hex>`) in
+    /// `--graph` at startup, exactly as if the client called
+    /// `sophia_agent_declare` first. Without it, any graph-bound session can
+    /// declare (or clear) an agent at runtime. Requires --graph.
     #[arg(long, env = "SOPHIA_MCP_AGENT_ID")]
     pub agent_id: Option<String>,
+
+    /// Milliseconds a read of the declared agent's modes counts as current;
+    /// tools/list and tools/call re-read the graph once it is older.
+    #[arg(long, default_value_t = 3000, env = "SOPHIA_MCP_MODE_CACHE_TTL_MS")]
+    pub mode_cache_ttl_ms: u64,
+
+    /// Milliseconds between background re-reads of the declared agent's
+    /// modes, so graph edits reach the client as tools/list_changed without a
+    /// call. 0 disables the poller.
+    #[arg(long, default_value_t = 15000, env = "SOPHIA_MCP_MODE_POLL_MS")]
+    pub mode_poll_ms: u64,
 
     /// Allow sending a bearer token (`--token`/`SOPHIA_MCP_TOKEN`, a sub's
     /// `--sub-token`, or the gateway service token) over plain `http://` to a
