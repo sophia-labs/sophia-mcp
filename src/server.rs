@@ -26,8 +26,21 @@ pub async fn serve_stdio(backend: Arc<dyn Backend>) -> anyhow::Result<()> {
             continue;
         }
 
+        let mut switched_mode = false;
         let response = match serde_json::from_str::<JsonRpcRequest>(line) {
-            Ok(req) => handle_request(backend.as_ref(), req).await,
+            Ok(req) => {
+                let is_mode_set =
+                    req.method == method::TOOLS_CALL && req.params["name"] == "sophia_mode_set";
+                let response = handle_request(backend.as_ref(), req).await;
+                switched_mode = is_mode_set
+                    && response.as_ref().is_some_and(|r| {
+                        r.error.is_none()
+                            && r.result
+                                .as_ref()
+                                .is_some_and(|v| v["structuredContent"]["changed"] == true)
+                    });
+                response
+            }
             Err(e) => Some(JsonRpcResponse::error(
                 None,
                 mcp::PARSE_ERROR,
@@ -40,6 +53,14 @@ pub async fn serve_stdio(backend: Arc<dyn Backend>) -> anyhow::Result<()> {
             bytes.push(b'\n');
             stdout.write_all(&bytes).await?;
             stdout.flush().await?;
+            if switched_mode {
+                stdout
+                    .write_all(
+                        b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n",
+                    )
+                    .await?;
+                stdout.flush().await?;
+            }
         }
     }
 

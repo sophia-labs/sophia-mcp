@@ -1,7 +1,7 @@
 //! sophia-mcp — a stdio MCP server that proxies Claude Code (and other MCP clients) to
 //! a Mnemosyne/garden backend. Tools are autopopulated from the backend; sophia-mcp
-//! never hardcodes them. Garden owns the tools; sophia-mcp owns who-you-are,
-//! which-graph, and which-backend.
+//! never hardcodes graph tools. Garden owns those tools; sophia-mcp owns
+//! identity, graph routing, and optional process-local mode controls.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +11,7 @@ use clap::Parser;
 
 use sophia_mcp::backend::{
     self, AuthHeaders, Backend, ComposedBackend, GatewayBackend, GatewayOptions, LocalGarden,
-    RemoteHttp,
+    ModeBackend, RemoteHttp,
 };
 use sophia_mcp::config::Cli;
 use sophia_mcp::server;
@@ -42,6 +42,15 @@ async fn main() -> anyhow::Result<()> {
         .await?;
         tracing::info!(subs = ?composed.sub_prefixes(), "sub-MCPs composed (see above for which are up)");
         backend = Arc::new(composed);
+    }
+
+    if let Some(agent_id) = cli.agent_id.as_deref() {
+        let graph_id = cli
+            .graph
+            .as_deref()
+            .context("--agent-id requires --graph")?;
+        backend = Arc::new(ModeBackend::new(backend, graph_id, agent_id)?);
+        tracing::info!(agent_id, graph_id, "MCP mode enforcement enabled");
     }
 
     tracing::info!("sophia-mcp proxy ready; serving MCP over stdio");

@@ -36,6 +36,9 @@ pub use local::LocalGarden;
 pub mod composed;
 pub use composed::ComposedBackend;
 
+pub mod mode;
+pub use mode::ModeBackend;
+
 #[cfg(feature = "local-garden-lib")]
 pub mod local_lib;
 
