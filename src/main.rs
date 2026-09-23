@@ -11,7 +11,7 @@ use clap::Parser;
 
 use sophia_mcp::backend::{
     self, AuthHeaders, Backend, ComposedBackend, GatewayBackend, GatewayOptions, LocalGarden,
-    ModeBackend, RemoteHttp,
+    ModeBackend, ModeOptions, RemoteHttp,
 };
 use sophia_mcp::config::{Cli, Command};
 use sophia_mcp::server;
@@ -52,13 +52,25 @@ async fn main() -> anyhow::Result<()> {
         backend = Arc::new(composed);
     }
 
-    if let Some(agent_id) = cli.agent_id.as_deref() {
-        let graph_id = cli
-            .graph
-            .as_deref()
-            .context("--agent-id requires --graph")?;
-        backend = Arc::new(ModeBackend::new(backend, graph_id, agent_id)?);
-        tracing::info!(agent_id, graph_id, "MCP mode enforcement enabled");
+    if let Some(graph_id) = cli.graph.as_deref() {
+        let options = ModeOptions {
+            cache_ttl: Duration::from_millis(cli.mode_cache_ttl_ms),
+            poll_interval: Duration::from_millis(cli.mode_poll_ms),
+        };
+        match ModeBackend::new(backend.clone(), graph_id, cli.agent_id.as_deref(), options) {
+            Ok(modes) => {
+                tracing::info!(
+                    graph_id,
+                    preset_agent = cli.agent_id.as_deref(),
+                    "agent declaration + live MCP modes available"
+                );
+                backend = modes;
+            }
+            Err(e) if cli.agent_id.is_some() => return Err(e),
+            Err(e) => tracing::warn!("agent declaration unavailable: {e:#}"),
+        }
+    } else if cli.agent_id.is_some() {
+        anyhow::bail!("--agent-id requires --graph");
     }
 
     tracing::info!("sophia-mcp proxy ready; serving MCP over stdio");

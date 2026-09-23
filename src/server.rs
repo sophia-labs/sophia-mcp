@@ -39,28 +39,35 @@ pub async fn serve_stdio(backend: Arc<dyn Backend>) -> anyhow::Result<()> {
             }
         })?;
     let mut stdout = tokio::io::stdout();
+    // Backend-initiated notifications (tools/list_changed after an agent
+    // declaration, a mode switch, or a live graph edit) are written between
+    // responses, never inside one, so stdout stays line-framed JSON-RPC.
+    let mut notifications = backend.take_notifications();
 
-    while let Some(line) = reader.recv().await {
+    loop {
+        let line = tokio::select! {
+            biased;
+            note = next_notification(&mut notifications) => {
+                match note {
+                    Some(note) => {
+                        write_line(&mut stdout, &note).await?;
+                    }
+                    None => notifications = None,
+                }
+                continue;
+            }
+            line = reader.recv() => match line {
+                Some(line) => line,
+                None => break,
+            },
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
 
-        let mut switched_mode = false;
         let response = match serde_json::from_str::<JsonRpcRequest>(line) {
-            Ok(req) => {
-                let is_mode_set =
-                    req.method == method::TOOLS_CALL && req.params["name"] == "sophia_mode_set";
-                let response = handle_request(backend.as_ref(), req).await;
-                switched_mode = is_mode_set
-                    && response.as_ref().is_some_and(|r| {
-                        r.error.is_none()
-                            && r.result
-                                .as_ref()
-                                .is_some_and(|v| v["structuredContent"]["changed"] == true)
-                    });
-                response
-            }
+            Ok(req) => handle_request(backend.as_ref(), req).await,
             Err(e) => Some(JsonRpcResponse::error(
                 None,
                 mcp::PARSE_ERROR,
@@ -69,21 +76,30 @@ pub async fn serve_stdio(backend: Arc<dyn Backend>) -> anyhow::Result<()> {
         };
 
         if let Some(resp) = response {
-            let mut bytes = serde_json::to_vec(&resp)?;
-            bytes.push(b'\n');
-            stdout.write_all(&bytes).await?;
-            stdout.flush().await?;
-            if switched_mode {
-                stdout
-                    .write_all(
-                        b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n",
-                    )
-                    .await?;
-                stdout.flush().await?;
-            }
+            write_line(&mut stdout, &resp).await?;
         }
     }
 
+    Ok(())
+}
+
+async fn next_notification(
+    notifications: &mut Option<tokio::sync::mpsc::UnboundedReceiver<Value>>,
+) -> Option<Value> {
+    match notifications {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn write_line(
+    stdout: &mut tokio::io::Stdout,
+    message: &impl serde::Serialize,
+) -> anyhow::Result<()> {
+    let mut bytes = serde_json::to_vec(message)?;
+    bytes.push(b'\n');
+    stdout.write_all(&bytes).await?;
+    stdout.flush().await?;
     Ok(())
 }
 

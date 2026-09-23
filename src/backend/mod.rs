@@ -37,7 +37,7 @@ pub mod composed;
 pub use composed::ComposedBackend;
 
 pub mod mode;
-pub use mode::ModeBackend;
+pub use mode::{ModeBackend, ModeOptions};
 
 #[cfg(feature = "local-garden-lib")]
 pub mod local_lib;
@@ -66,4 +66,12 @@ pub trait Backend: Send + Sync {
     /// Forward `tools/call`. `params` is `{ name, arguments }`. Returns the
     /// backend's result object (`{ content, structuredContent, isError? }`).
     async fn call_tool(&self, params: Value) -> anyhow::Result<Value>;
+
+    /// Server-initiated JSON-RPC notifications (e.g.
+    /// `notifications/tools/list_changed`) for the stdio server to write
+    /// between responses. Taken once by the server; `None` when the backend
+    /// never notifies.
+    fn take_notifications(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Value>> {
+        None
+    }
 }

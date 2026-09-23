@@ -300,12 +300,35 @@ Progress is logged to stderr only (`SOPHIA_MCP_LOG=info`).
 
 ## MCP modes
 
-To run one MCP process as an agent with graph-defined modes, supply its
-canonical agent ID and bound graph:
+Any MCP session bound to a graph (`--graph`) can **declare the agent it acts
+as**, at runtime, over MCP. Three proxy tools are always present:
+
+| Tool | Purpose |
+|---|---|
+| `sophia_agent_declare` | `{ "agentId": "agent-<hex>" }` — bind this MCP connection to a canonical agent in the bound graph |
+| `sophia_agent_status` | Show the declared agent, its active mode, and whether the mode definitions were read recently |
+| `sophia_agent_clear` | Forget the declaration; the full tool catalogue returns |
+
+Without a declaration nothing changes: the session sees the backend's full
+catalogue (plus those three tools) and calls pass straight through. Declaring
+selects the agent's `agt:defaultMode` (or *controls only* if it has none),
+narrows `tools/list` to that mode, and sends
+`notifications/tools/list_changed` (the proxy advertises
+`capabilities.tools.listChanged: true`). Once an agent is declared, three mode
+tools appear as well:
+
+| Tool | Purpose |
+|---|---|
+| `sophia_mode_status` | Show the selected mode and whether its definition is current |
+| `sophia_mode_list` | List the modes the graph currently assigns to this agent |
+| `sophia_mode_set` | Select an assigned mode by its exact `modeIri` for this MCP connection |
 
 ```sh
+# Declare at runtime (recommended): no flag, the agent calls sophia_agent_declare.
+sophia-mcp --backend local --graph my-graph
+# Or preset the declaration at startup (same as declaring before the first request):
 sophia-mcp --backend local --graph my-graph --agent-id agent-deadbeef
-# The same flags work with a hosted gateway plus --owner and its normal auth.
+# The same works with a hosted gateway plus --owner and its normal auth.
 ```
 
 The agent's `agt:defaultMode` and `agt:mayUseMode` assignments and each
@@ -314,37 +337,40 @@ The agent's `agt:defaultMode` and `agt:mayUseMode` assignments and each
 through the backend's existing `sparql_query` MCP tool. Shrubbery's Modes
 editor writes this RDF; no new Garden route or hosted gateway route is needed.
 This works for local gardend, direct Garden `/mcp`, and the hosted gateway.
-Create the graph, agent, and mode assignments first with a trusted graph writer
-(for example Shrubbery's Modes editor). An empty local profile has no mode
-assignment to select.
 
-With `--agent-id`, three proxy tools are always available:
+**Live definitions.** The proxy re-reads the declared agent's assignments and
+modes before each `tools/list` and `tools/call` (a read counts as current for
+`--mode-cache-ttl-ms`, default 3 s) and in the background every
+`--mode-poll-ms` (default 15 s), so an edit made in Shrubbery's Modes editor
+reaches the client as `notifications/tools/list_changed` without a call or a
+restart. New modes are selectable immediately. If the active mode is revoked
+or unassigned, the proxy falls back to the default mode (or controls only),
+notifies, and the next call is refused with a message saying so. A call is
+only admitted against a definition read within the TTL: if the graph cannot be
+read, the call fails closed with a retryable error while the agent and mode
+controls stay available (discovery keeps showing the last good read).
 
-| Tool | Purpose |
-|---|---|
-| `sophia_mode_status` | Show the selected mode and whether its assignment and definition are current |
-| `sophia_mode_list` | List this agent's assigned modes |
-| `sophia_mode_set` | Select an assigned mode by its exact `modeIri` for this MCP process |
+**Enforcement.** `tools/list` includes only tools in the current mode, and
+`tools/call` independently rejects calls outside it. A read mode admits only
+tools whose Garden scope metadata proves a read effect; unknown effects are
+withheld. Graph scopes fence the bound graph and any `graphId` or `graph_id`
+argument; a scoped mode also withholds tools that lack Garden's scope
+metadata. Approval-required calls are denied until there is a human approval
+queue.
 
-The initial selection is `agt:defaultMode`. If there is no default, only the
-mode control tools appear until a mode is selected. `tools/list` includes only
-tools in the current mode, and `tools/call` independently rejects calls outside
-it. A read mode admits only tools whose Garden scope metadata proves a read
-effect; unknown effects are withheld. Graph scopes fence the bound graph and
-any `graphId` or `graph_id` argument; a scoped mode also withholds tools that
-lack Garden's scope metadata. Approval-required calls are denied until
-there is a human approval queue. Switching sends
-`notifications/tools/list_changed` so MCP clients can refresh discovery.
+**Open permissions question.** A declared agent is a *claim by the caller*:
+any client of this MCP process can declare any agent the graph defines, or
+clear the declaration and see the full catalogue. Modes narrow what an honest
+agent is offered; they are not a security boundary against its own caller.
+The underlying Garden/gateway credential and its ACLs remain the authority
+ceiling. Binding agent identity to credentials is future work. A credential
+that can edit mode RDF can change what agents are offered, live; use a
+separate trusted graph writer when modes need to serve as durable policy.
 
-Selection is process-local and resets to the default on restart. The proxy
-pins the initially assigned mode definitions, re-reads the graph before each
-call, and fails closed if the active mode was edited or revoked. New modes and
-edits become selectable after a proxy restart. The underlying Garden/gateway
-credential and its ACLs remain the authority ceiling. A credential that can
-edit its own mode RDF can change what a *future* proxy process may select; use
-a separate trusted graph writer when modes need to serve as durable policy.
-Choreograph Sessions have their own launch-time mode pin; changing this MCP
-process's mode does not change an already running Choreograph Session.
+Selection is per MCP connection (process) and resets on restart (to nothing,
+or to the `--agent-id` preset's default). Choreograph Sessions have their own
+launch-time mode pin; changing this MCP process's mode does not change an
+already running Choreograph Session.
 
 ---
 
@@ -360,7 +386,9 @@ Every flag has an env var twin.
 | `--user-id` | `SOPHIA_MCP_USER_ID` | — | `X-User-ID` side-channel |
 | `--owner` | `SOPHIA_MCP_OWNER` | — | stable typed owner required for cloud-2 |
 | `--graph` | `SOPHIA_MCP_GRAPH` | — | local graph id required for cloud-2 (the *bound* graph) |
-| `--agent-id` | `SOPHIA_MCP_AGENT_ID` | — | enable process-scoped MCP modes for canonical `agent-<hex>` in `--graph` |
+| `--agent-id` | `SOPHIA_MCP_AGENT_ID` | — | optional preset: declare canonical `agent-<hex>` in `--graph` at startup (agents can also declare at runtime with `sophia_agent_declare`) |
+| `--mode-cache-ttl-ms` | `SOPHIA_MCP_MODE_CACHE_TTL_MS` | `3000` | how long a read of the declared agent's modes counts as current |
+| `--mode-poll-ms` | `SOPHIA_MCP_MODE_POLL_MS` | `15000` | background re-read interval for live mode edits (`0` disables) |
 | `--allow-insecure-http` | `SOPHIA_MCP_ALLOW_INSECURE_HTTP` | `false` | allow sending a bearer over plain `http://` to a non-loopback host (loopback is always allowed regardless) |
 | `--activation-timeout` | `SOPHIA_MCP_ACTIVATION_TIMEOUT` | `300` | seconds to wait for a cell to become routable (gateway-only) |
 | `--activation-poll` | `SOPHIA_MCP_ACTIVATION_POLL` | `2` | seconds between activation polls; base of the re-probe backoff (gateway-only) |
@@ -445,8 +473,9 @@ Claude Code ──stdio JSON-RPC──▶ sophia-mcp ──HTTP JSON-RPC──�
   to `/mcp`, a single JSON response. (Both gardend's loopback and the gateway
   speak this; the gateway forwards it byte-for-byte.)
 * **Tools:** graph tools come from the backend's catalog (for a gateway: cell ∪
-  control, see *Multi-graph*). With `--agent-id`, the proxy adds its three mode
-  controls and fences both discovery and calls to the selected mode.
+  control, see *Multi-graph*). With `--graph`, the proxy adds the three
+  `sophia_agent_*` tools; once an agent is declared it adds the mode controls
+  and fences both discovery and calls to the selected, live mode.
 * **`structuredContent` is always an object at the client:** MCP requires it, and Claude Code rejects anything else; when an upstream answers with an array (the gateway control plane's `list_graphs` does) sophia-mcp wraps it as `{"items": [...]}` (a scalar as `{"value": …}`), leaving objects and `content` untouched — logged at `debug` once per tool.
 * **Error messages to the client are bounded and redacted; full detail goes to stderr.** A failed call's full `anyhow` chain is always logged (`tracing::error!`) for operators; the JSON-RPC error message the MCP client actually sees is capped at 2 KB, and any raw upstream HTTP body embedded along the way is separately capped at 500 bytes with an explicit truncation marker before it's ever interpolated into a message — never shipped whole to an untrusted-by-default client. This is a real error-contract behavior change from 0.2.x, where the full chain (including full upstream bodies) went straight to the client — one reason this release is 0.3.0.
 

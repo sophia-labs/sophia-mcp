@@ -1,15 +1,33 @@
-//! Process-scoped MCP modes. This wrapper works above the hosted gateway,
-//! direct Garden MCP, local gardend, and composed sub-MCPs. The backing graph
-//! owns mode definitions; the proxy owns the current selection and enforces
-//! it on both discovery and calls. No mode bytes come from tool arguments.
+//! Agent declaration and live, graph-defined MCP modes.
+//!
+//! This wrapper sits above every backend (hosted gateway, direct Garden MCP,
+//! local gardend, composed sub-MCPs) whenever the process is bound to a graph.
+//! Without a declared agent it is a pass-through that only adds the three
+//! `sophia_agent_*` tools. A caller declares an agent at runtime with
+//! `sophia_agent_declare` (or at start with `--agent-id`); from then on the
+//! bound graph owns the mode definitions and the proxy owns the selection and
+//! enforces it on both discovery and calls.
+//!
+//! Definitions are live: the agent's assignments and modes are re-read from
+//! the graph's user RDF partition before `tools/list` and `tools/call` (cached
+//! for a short TTL) and by a background poller, and every change to the
+//! effective tool set emits `notifications/tools/list_changed`. A call is only
+//! ever admitted against a definition read within the TTL; when the graph
+//! cannot be read the call fails closed with a retryable error while the
+//! control tools stay available. No mode bytes come from tool arguments.
+//!
+//! A declared agent is a claim made by the MCP caller. The underlying
+//! credential and its gateway/Garden ACLs remain the authority ceiling;
+//! binding agent identity to credentials is future work.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 use super::{Backend, ToolNotFound};
 
@@ -20,9 +38,32 @@ const MAX_MODE_ROWS: usize = 5000;
 const MAX_CATALOG_PAGES: usize = 20;
 const MAX_CATALOG_TOOLS: usize = 2000;
 
+pub const AGENT_DECLARE: &str = "sophia_agent_declare";
+pub const AGENT_STATUS: &str = "sophia_agent_status";
+pub const AGENT_CLEAR: &str = "sophia_agent_clear";
 pub const MODE_STATUS: &str = "sophia_mode_status";
 pub const MODE_LIST: &str = "sophia_mode_list";
 pub const MODE_SET: &str = "sophia_mode_set";
+
+/// Refresh cadence for live mode definitions.
+#[derive(Clone, Debug)]
+pub struct ModeOptions {
+    /// How long a successful read of the agent's modes counts as current.
+    /// `tools/list` and `tools/call` re-read the graph once it is older.
+    pub cache_ttl: Duration,
+    /// Background re-read interval while an agent is declared, so edits show
+    /// up (as `list_changed`) without a call. Zero disables the poller.
+    pub poll_interval: Duration,
+}
+
+impl Default for ModeOptions {
+    fn default() -> Self {
+        Self {
+            cache_ttl: Duration::from_secs(3),
+            poll_interval: Duration::from_secs(15),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Mode {
@@ -34,7 +75,7 @@ struct Mode {
     approvals: BTreeSet<String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Catalog {
     default: Option<String>,
     permitted: BTreeSet<String>,
@@ -42,43 +83,113 @@ struct Catalog {
 }
 
 #[derive(Debug, Default)]
-struct Selection {
-    initialized: bool,
+struct Session {
+    /// The declared agent. `None` = undeclared: full pass-through catalogue.
+    agent: Option<String>,
+    /// The selected mode definition as of the last successful read.
     active: Option<Mode>,
-    /// The process's initial authority envelope. Graph edits can revoke or
-    /// invalidate it, but cannot add a mode or widen a mode until restart.
-    pinned_modes: BTreeMap<String, Mode>,
+    /// The last successful read of the agent's modes.
+    catalog: Option<Catalog>,
+    fetched_at: Option<Instant>,
+    last_error: Option<String>,
+    /// Told to the caller on its next call (e.g. the active mode was revoked).
+    notice: Option<String>,
 }
 
-/// A mode switch affects this MCP process only. Restarting selects the graph's
-/// default again. The lock serializes selection with calls, so a successful
-/// switch cannot race a call under the old tool set.
+/// What `tools/list` shows depends only on this; a change emits list_changed.
+#[derive(PartialEq, Eq)]
+struct Visible(bool, Option<Mode>);
+
+impl Session {
+    fn visible(&self) -> Visible {
+        Visible(self.agent.is_some(), self.active.clone())
+    }
+
+    fn fresh(&self, ttl: Duration) -> bool {
+        self.last_error.is_none() && self.fetched_at.is_some_and(|at| at.elapsed() < ttl)
+    }
+
+    /// Adopt a new read of the graph. The selection follows its live
+    /// definition; a revoked selection falls back to the default mode (or to
+    /// controls only), and an empty selection adopts the default.
+    fn install(&mut self, catalog: Catalog) {
+        self.fetched_at = Some(Instant::now());
+        self.last_error = None;
+        let default = catalog
+            .default
+            .as_ref()
+            .and_then(|iri| catalog.modes.get(iri))
+            .cloned();
+        match self.active.take() {
+            None => self.active = default,
+            Some(old) => match catalog.modes.get(&old.iri) {
+                Some(mode) if catalog.permitted.contains(&old.iri) => {
+                    self.active = Some(mode.clone())
+                }
+                _ => {
+                    let fallback = default
+                        .as_ref()
+                        .map_or_else(|| "controls only".to_owned(), |m| format!("<{}>", m.iri));
+                    self.notice = Some(format!(
+                        "mode <{}> was revoked or unassigned for {}; this MCP process fell back to {fallback}",
+                        old.iri,
+                        self.agent.as_deref().unwrap_or("the agent")
+                    ));
+                    self.active = default;
+                }
+            },
+        }
+        self.catalog = Some(catalog);
+    }
+}
+
+/// The selection belongs to this MCP process (connection) only; restarting
+/// forgets the declaration unless `--agent-id` presets it.
 pub struct ModeBackend {
     inner: Arc<dyn Backend>,
     graph_id: String,
-    agent_id: String,
-    selection: Mutex<Selection>,
+    options: ModeOptions,
+    session: Mutex<Session>,
+    notify_tx: mpsc::UnboundedSender<Value>,
+    notify_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
 }
 
 impl ModeBackend {
-    pub fn new(inner: Arc<dyn Backend>, graph_id: &str, agent_id: &str) -> anyhow::Result<Self> {
+    /// Wrap `inner` for a graph-bound process. `preset_agent` is the optional
+    /// `--agent-id`, equivalent to declaring it before the first request.
+    pub fn new(
+        inner: Arc<dyn Backend>,
+        graph_id: &str,
+        preset_agent: Option<&str>,
+        options: ModeOptions,
+    ) -> anyhow::Result<Arc<Self>> {
         if !valid_graph_id(graph_id) {
             bail!("--graph must be a simple graph id for MCP modes");
         }
-        if !valid_agent_id(agent_id) {
+        if preset_agent.is_some_and(|agent| !valid_agent_id(agent)) {
             bail!("--agent-id must be a canonical agent-<hex> id for MCP modes");
         }
-        Ok(Self {
+        let (notify_tx, notify_rx) = mpsc::unbounded_channel();
+        let this = Arc::new(Self {
             inner,
             graph_id: graph_id.to_owned(),
-            agent_id: agent_id.to_owned(),
-            selection: Mutex::new(Selection::default()),
-        })
+            options,
+            session: Mutex::new(Session {
+                agent: preset_agent.map(str::to_owned),
+                ..Session::default()
+            }),
+            notify_tx,
+            notify_rx: std::sync::Mutex::new(Some(notify_rx)),
+        });
+        if !this.options.poll_interval.is_zero() {
+            tokio::spawn(poll(Arc::downgrade(&this), this.options.poll_interval));
+        }
+        Ok(this)
     }
 
-    fn query(&self) -> String {
+    fn query(&self, agent_id: &str) -> String {
         let graph = format!("urn:mnemosyne:local:graph:{}:user:rdf", self.graph_id);
-        let agent = format!("urn:sophia:agent:{}", self.agent_id);
+        let agent = format!("urn:sophia:agent:{agent_id}");
         // Only the user RDF partition that the editor writes is authoritative.
         // An unrelated named graph may not inject an assignment or mode.
         format!(
@@ -87,10 +198,10 @@ impl ModeBackend {
         )
     }
 
-    async fn catalog(&self) -> anyhow::Result<Catalog> {
+    async fn fetch(&self, agent_id: &str) -> anyhow::Result<Catalog> {
         let result = self
             .inner
-            .call_tool(json!({"name":"sparql_query", "arguments": {"graphId":self.graph_id, "query":self.query()}}))
+            .call_tool(json!({"name":"sparql_query", "arguments": {"graphId":self.graph_id, "query":self.query(agent_id)}}))
             .await
             .context("read agent mode catalog through the bound graph MCP")?;
         if result["isError"] == true {
@@ -99,34 +210,36 @@ impl ModeBackend {
         parse_catalog(&result)
     }
 
-    fn active<'a>(
-        &self,
-        state: &'a mut Selection,
-        catalog: &Catalog,
-    ) -> anyhow::Result<Option<&'a Mode>> {
-        if !state.initialized {
-            state.initialized = true;
-            state.pinned_modes = catalog.modes.clone();
-            state.active = catalog
-                .default
-                .as_ref()
-                .and_then(|iri| catalog.modes.get(iri))
-                .cloned();
-        }
-        let Some(active) = &state.active else {
-            return Ok(None);
+    /// Re-read the declared agent's modes unless the last read is within the
+    /// TTL. On failure the last good read is kept for discovery only; the
+    /// error is returned so calls can fail closed.
+    async fn ensure_current(&self, session: &mut Session) -> anyhow::Result<()> {
+        let Some(agent) = session.agent.clone() else {
+            return Ok(());
         };
-        if !catalog.permitted.contains(&active.iri)
-            || state.pinned_modes.get(&active.iri) != Some(active)
-            || catalog.modes.get(&active.iri) != Some(active)
-        {
-            // Preserve the previous selection as evidence, but never use it
-            // after an assignment was revoked or the definition was edited.
-            return Err(anyhow!(
-                "active mode changed or was revoked; select an assigned mode with {MODE_SET}"
-            ));
+        if session.fresh(self.options.cache_ttl) {
+            return Ok(());
         }
-        Ok(state.active.as_ref())
+        match self.fetch(&agent).await {
+            Ok(catalog) => {
+                session.install(catalog);
+                Ok(())
+            }
+            Err(error) => {
+                session.last_error = Some(format!("{error:#}"));
+                Err(error)
+            }
+        }
+    }
+
+    fn notify_if_changed(&self, before: &Visible, session: &Session) {
+        if *before != session.visible() {
+            // The receiver lives as long as the stdio server; a send after it
+            // stopped has nobody to tell.
+            let _ = self
+                .notify_tx
+                .send(json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}));
+        }
     }
 
     async fn full_tools(&self) -> anyhow::Result<Vec<Value>> {
@@ -168,11 +281,21 @@ impl ModeBackend {
         bail!("MCP tools/list exceeds {MAX_CATALOG_PAGES} pages")
     }
 
-    fn control_tools() -> Vec<Value> {
+    fn agent_tools() -> Vec<Value> {
+        let empty = json!({"type":"object","properties":{},"additionalProperties":false});
         vec![
-            json!({"name":MODE_STATUS,"description":"Show this MCP process's selected mode and whether its graph assignment is still current.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
-            json!({"name":MODE_LIST,"description":"List modes assigned to this agent in the bound graph. A mode switch affects this MCP process only.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
-            json!({"name":MODE_SET,"description":"Switch this MCP process to one of this agent's assigned modes. Tool availability changes immediately.","inputSchema":{"type":"object","properties":{"modeIri":{"type":"string","description":"Exact urn:sophia:mode:{slug} IRI from sophia_mode_list"}},"required":["modeIri"],"additionalProperties":false}}),
+            json!({"name":AGENT_DECLARE,"description":"Declare which agent this MCP connection acts as. Selects the agent's default mode from the bound graph and narrows the tool list to it (clients get notifications/tools/list_changed). Mode definitions are re-read live from the graph. The declaration is a claim by the caller; the credential's ACL stays the authority ceiling.","inputSchema":{"type":"object","properties":{"agentId":{"type":"string","description":"Canonical agent id, agent-<lowercase hex>"}},"required":["agentId"],"additionalProperties":false}}),
+            json!({"name":AGENT_STATUS,"description":"Show the agent declared on this MCP connection (if any), its active mode, and whether the mode definitions were read from the graph recently.","inputSchema":empty}),
+            json!({"name":AGENT_CLEAR,"description":"Forget the declared agent and return this MCP connection to the full tool catalogue.","inputSchema":empty}),
+        ]
+    }
+
+    fn mode_tools() -> Vec<Value> {
+        let empty = json!({"type":"object","properties":{},"additionalProperties":false});
+        vec![
+            json!({"name":MODE_STATUS,"description":"Show this MCP connection's selected mode and whether its graph definition is current.","inputSchema":empty}),
+            json!({"name":MODE_LIST,"description":"List the modes the bound graph currently assigns to the declared agent. A mode switch affects this MCP connection only.","inputSchema":empty}),
+            json!({"name":MODE_SET,"description":"Switch this MCP connection to one of the declared agent's assigned modes. Tool availability changes immediately.","inputSchema":{"type":"object","properties":{"modeIri":{"type":"string","description":"Exact urn:sophia:mode:{slug} IRI from sophia_mode_list"}},"required":["modeIri"],"additionalProperties":false}}),
         ]
     }
 
@@ -180,20 +303,120 @@ impl ModeBackend {
         json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value})
     }
 
-    fn summary(&self, active: Option<&Mode>, current: bool) -> Value {
+    fn status(&self, session: &Session, current: bool) -> Value {
+        let active = session.active.as_ref();
         json!({
-            "agentId": self.agent_id,
+            "declared": session.agent.is_some(),
+            "agentId": session.agent,
             "graphId": self.graph_id,
             "activeMode": active.map(|mode| &mode.iri),
             "label": active.map(|mode| &mode.label),
             "access": active.map(|mode| &mode.access),
             "current": current,
+            "lastError": session.last_error,
+            "cacheTtlMs": u64::try_from(self.options.cache_ttl.as_millis()).unwrap_or(u64::MAX),
         })
     }
 
     fn mode_summary(mode: &Mode) -> Value {
         json!({"iri":mode.iri,"label":mode.label,"access":mode.access,
             "allowsTools":mode.allows,"graphScopes":mode.graphs,"requiresApproval":mode.approvals})
+    }
+
+    fn assigned_modes(session: &Session) -> Vec<Value> {
+        session.catalog.as_ref().map_or_else(Vec::new, |catalog| {
+            catalog
+                .modes
+                .values()
+                .filter(|mode| catalog.permitted.contains(&mode.iri))
+                .map(Self::mode_summary)
+                .collect()
+        })
+    }
+
+    async fn declare(&self, params: &Value) -> anyhow::Result<Value> {
+        let args = params["arguments"]
+            .as_object()
+            .context("sophia_agent_declare arguments must be an object")?;
+        if args.len() != 1 {
+            bail!("sophia_agent_declare accepts only agentId");
+        }
+        let agent = args
+            .get("agentId")
+            .and_then(Value::as_str)
+            .context("sophia_agent_declare requires agentId")?;
+        if !valid_agent_id(agent) {
+            bail!("agentId must be a canonical agent-<lowercase hex> id");
+        }
+        let mut session = self.session.lock().await;
+        // Read first: a failed read leaves the previous declaration intact.
+        let catalog = self.fetch(agent).await.with_context(|| {
+            format!(
+                "could not read the modes of {agent} from graph '{}' (retryable)",
+                self.graph_id
+            )
+        })?;
+        let before = session.visible();
+        *session = Session {
+            agent: Some(agent.to_owned()),
+            ..Session::default()
+        };
+        session.install(catalog);
+        self.notify_if_changed(&before, &session);
+        let mut result = self.status(&session, true);
+        result["modes"] = json!(Self::assigned_modes(&session));
+        if session.active.is_none() {
+            result["note"] = json!("no default mode is assigned; only the agent and mode controls are available until sophia_mode_set selects one");
+        }
+        Ok(Self::tool_result(result))
+    }
+
+    async fn clear(&self) -> Value {
+        let mut session = self.session.lock().await;
+        let before = session.visible();
+        let previous = session.agent.take();
+        *session = Session::default();
+        self.notify_if_changed(&before, &session);
+        Self::tool_result(
+            json!({"cleared": previous.is_some(), "previousAgentId": previous, "graphId": self.graph_id}),
+        )
+    }
+
+    async fn agent_status(&self) -> Value {
+        let mut session = self.session.lock().await;
+        let before = session.visible();
+        let current = session.agent.is_some() && self.ensure_current(&mut session).await.is_ok();
+        self.notify_if_changed(&before, &session);
+        Self::tool_result(self.status(&session, current))
+    }
+
+    async fn refresh_poll(&self) {
+        let mut session = self.session.lock().await;
+        let Some(agent) = session.agent.clone() else {
+            return;
+        };
+        let before = session.visible();
+        match self.fetch(&agent).await {
+            Ok(catalog) => session.install(catalog),
+            Err(error) => {
+                tracing::warn!(agent, "background mode refresh failed: {error:#}");
+                session.last_error = Some(format!("{error:#}"));
+            }
+        }
+        self.notify_if_changed(&before, &session);
+    }
+}
+
+async fn poll(this: Weak<ModeBackend>, every: Duration) {
+    let mut ticker = tokio::time::interval(every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let Some(this) = this.upgrade() else {
+            return;
+        };
+        this.refresh_poll().await;
     }
 }
 
@@ -208,15 +431,42 @@ impl Backend for ModeBackend {
         Ok(result)
     }
 
-    async fn list_tools(&self, _params: Value) -> anyhow::Result<Value> {
-        let mut state = self.selection.lock().await;
-        let catalog = self.catalog().await?;
-        let active = self.active(&mut state, &catalog).ok().flatten();
-        let mut tools = Self::control_tools();
+    async fn list_tools(&self, params: Value) -> anyhow::Result<Value> {
+        let mut session = self.session.lock().await;
+        let before = session.visible();
+        let refreshed = self.ensure_current(&mut session).await;
+        self.notify_if_changed(&before, &session);
+        if session.agent.is_none() {
+            drop(session);
+            let mut page = self.inner.list_tools(params.clone()).await?;
+            let tools = page["tools"]
+                .as_array_mut()
+                .context("MCP tools/list returned no tools array")?;
+            if let Some(name) = tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .find(|name| is_control_tool(name))
+            {
+                bail!("upstream MCP tool '{name}' conflicts with proxy agent control");
+            }
+            if params.get("cursor").is_none_or(Value::is_null) {
+                tools.extend(Self::agent_tools());
+            }
+            return Ok(page);
+        }
+        if let Err(error) = refreshed {
+            if session.catalog.is_none() {
+                return Err(error.context("reading the declared agent's modes (retryable)"));
+            }
+            tracing::warn!("listing tools from the last good mode read: {error:#}");
+        }
+        let active = session.active.clone();
+        drop(session);
+        let mut tools = Self::agent_tools();
+        tools.extend(Self::mode_tools());
         if let Some(mode) = active {
-            let upstream = self.full_tools().await?;
-            for tool in upstream {
-                if mode_allows(mode, &tool, &self.graph_id) {
+            for tool in self.full_tools().await? {
+                if mode_allows(&mode, &tool, &self.graph_id) {
                     tools.push(tool);
                 }
             }
@@ -228,27 +478,46 @@ impl Backend for ModeBackend {
         let name = params["name"]
             .as_str()
             .context("tools/call params.name must be a string")?;
-        let mut state = self.selection.lock().await;
-        let catalog = self.catalog().await?;
-        self.active(&mut state, &catalog).ok();
-        if name == MODE_LIST {
-            let modes: Vec<Value> = state
-                .pinned_modes
-                .iter()
-                .filter(|(iri, mode)| {
-                    catalog.permitted.contains(*iri) && catalog.modes.get(*iri) == Some(*mode)
-                })
-                .map(|(_, mode)| Self::mode_summary(mode))
-                .collect();
-            let current = matches!(self.active(&mut state, &catalog), Ok(Some(_)));
-            return Ok(Self::tool_result(
-                json!({"modes":modes,"activeMode":state.active.as_ref().map(|m| &m.iri),"current":current}),
-            ));
+        match name {
+            AGENT_DECLARE => return self.declare(&params).await,
+            AGENT_CLEAR => return Ok(self.clear().await),
+            AGENT_STATUS => return Ok(self.agent_status().await),
+            _ => {}
         }
+        let mut session = self.session.lock().await;
+        let Some(agent) = session.agent.clone() else {
+            if is_control_tool(name) {
+                bail!("no agent is declared on this MCP connection; call {AGENT_DECLARE} first");
+            }
+            drop(session);
+            return self.inner.call_tool(params).await;
+        };
+        let before = session.visible();
+        let refreshed = self.ensure_current(&mut session).await;
+        self.notify_if_changed(&before, &session);
+
         if name == MODE_STATUS {
-            let current = matches!(self.active(&mut state, &catalog), Ok(Some(_)));
-            return Ok(Self::tool_result(
-                self.summary(state.active.as_ref(), current),
+            let mut result = self.status(&session, refreshed.is_ok());
+            if let Some(notice) = session.notice.take() {
+                result["notice"] = json!(notice);
+            }
+            return Ok(Self::tool_result(result));
+        }
+        if name == MODE_LIST {
+            let mut result = json!({
+                "modes": Self::assigned_modes(&session),
+                "activeMode": session.active.as_ref().map(|m| &m.iri),
+                "current": refreshed.is_ok(),
+            });
+            if let Some(notice) = session.notice.take() {
+                result["notice"] = json!(notice);
+            }
+            return Ok(Self::tool_result(result));
+        }
+        if let Err(error) = refreshed {
+            return Err(anyhow!(
+                "retryable: could not re-read the modes of {agent} from graph '{}', so '{name}' was denied (fail closed); agent and mode controls remain available: {error:#}",
+                self.graph_id
             ));
         }
         if name == MODE_SET {
@@ -265,30 +534,35 @@ impl Backend for ModeBackend {
             if !valid_mode_iri(iri) {
                 bail!("modeIri must be urn:sophia:mode:<slug>");
             }
-            let mode = state
-                .pinned_modes
+            let catalog = session.catalog.as_ref().context("no mode catalogue read")?;
+            let mode = catalog
+                .modes
                 .get(iri)
-                .context("mode was not assigned when this MCP process started")?
+                .filter(|_| catalog.permitted.contains(iri))
+                .with_context(|| format!("mode <{iri}> is not assigned to {agent}"))?
                 .clone();
-            if !catalog.permitted.contains(iri) || catalog.modes.get(iri) != Some(&mode) {
-                bail!("mode <{iri}> changed or is no longer assigned to this agent");
-            }
-            let changed = state.active.as_ref() != Some(&mode);
-            state.initialized = true;
-            state.active = Some(mode.clone());
+            let changed = session.active.as_ref() != Some(&mode);
+            session.active = Some(mode.clone());
+            session.notice = None;
+            self.notify_if_changed(&before, &session);
             return Ok(Self::tool_result(
                 json!({"activeMode":iri,"changed":changed,"access":mode.access,"graphId":self.graph_id}),
             ));
         }
-        let mode = self
-            .active(&mut state, &catalog)?
-            .context("no active mode; select one with sophia_mode_set")?;
+        if let Some(notice) = session.notice.take() {
+            bail!("{notice}. '{name}' was not called; refresh tools/list and retry");
+        }
+        let mode = session
+            .active
+            .clone()
+            .with_context(|| format!("{agent} has no active mode; select one with {MODE_SET}"))?;
+        drop(session);
         let tools = self.full_tools().await?;
         let descriptor = tools
             .iter()
             .find(|tool| tool["name"] == name)
             .ok_or_else(|| ToolNotFound(name.to_owned()))?;
-        if !mode_allows(mode, descriptor, &self.graph_id) {
+        if !mode_allows(&mode, descriptor, &self.graph_id) {
             bail!("mode <{}> denies tool '{name}'", mode.iri);
         }
         if mode.approvals.contains(name) {
@@ -307,10 +581,17 @@ impl Backend for ModeBackend {
         }
         self.inner.call_tool(params).await
     }
+
+    fn take_notifications(&self) -> Option<mpsc::UnboundedReceiver<Value>> {
+        self.notify_rx.lock().ok()?.take()
+    }
 }
 
 fn is_control_tool(name: &str) -> bool {
-    matches!(name, MODE_STATUS | MODE_LIST | MODE_SET)
+    matches!(
+        name,
+        AGENT_DECLARE | AGENT_STATUS | AGENT_CLEAR | MODE_STATUS | MODE_LIST | MODE_SET
+    )
 }
 
 fn mode_allows(mode: &Mode, tool: &Value, bound_graph: &str) -> bool {
@@ -558,10 +839,12 @@ mod tests {
     const READER: &str = "urn:sophia:mode:reader";
     const WRITER: &str = "urn:sophia:mode:writer";
 
+    /// A Garden-shaped cell whose mode RDF can be edited between requests.
     struct Cell {
         revoked: AtomicBool,
         expanded: AtomicBool,
         duplicate: AtomicBool,
+        unreadable: AtomicBool,
         calls: Mutex<Vec<String>>,
     }
 
@@ -571,6 +854,7 @@ mod tests {
                 revoked: AtomicBool::new(false),
                 expanded: AtomicBool::new(false),
                 duplicate: AtomicBool::new(false),
+                unreadable: AtomicBool::new(false),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -609,7 +893,7 @@ mod tests {
             ));
         }
         for (slug, access, tools, approvals) in definitions {
-            if revoked && slug == "reader" {
+            if revoked && slug == "writer" {
                 continue;
             }
             let mode = format!("urn:sophia:mode:{slug}");
@@ -663,6 +947,9 @@ mod tests {
         async fn call_tool(&self, params: Value) -> anyhow::Result<Value> {
             let name = params["name"].as_str().unwrap_or_default();
             if name == "sparql_query" {
+                if self.unreadable.load(Ordering::SeqCst) {
+                    bail!("upstream HTTP 503");
+                }
                 let query = params["arguments"]["query"].as_str().unwrap_or_default();
                 assert!(query.contains("GRAPH <urn:mnemosyne:local:graph:lab:user:rdf>"));
                 assert!(query.contains("<urn:sophia:agent:agent-deadbeef>"));
@@ -672,6 +959,13 @@ mod tests {
             }
             self.calls.lock().await.push(name.to_owned());
             Ok(json!({"structuredContent":{"forwarded":name}}))
+        }
+    }
+
+    fn live() -> ModeOptions {
+        ModeOptions {
+            cache_ttl: Duration::ZERO,
+            poll_interval: Duration::ZERO,
         }
     }
 
@@ -686,18 +980,75 @@ mod tests {
     fn call(name: &str, arguments: Value) -> Value {
         json!({"name":name,"arguments":arguments})
     }
+    fn controls() -> Vec<&'static str> {
+        vec![
+            AGENT_DECLARE,
+            AGENT_STATUS,
+            AGENT_CLEAR,
+            MODE_STATUS,
+            MODE_LIST,
+            MODE_SET,
+        ]
+    }
+    fn with(extra: &[&'static str]) -> Vec<&'static str> {
+        let mut all = controls();
+        all.extend_from_slice(extra);
+        all
+    }
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Value>) -> usize {
+        let mut count = 0;
+        while let Ok(note) = rx.try_recv() {
+            assert_eq!(note["method"], "notifications/tools/list_changed");
+            count += 1;
+        }
+        count
+    }
 
     #[tokio::test]
-    async fn mode_switch_changes_discovery_and_call_enforcement() {
+    async fn undeclared_is_a_pass_through_plus_agent_tools() {
         let cell = Arc::new(Cell::new());
-        let proxy = ModeBackend::new(cell.clone(), "lab", AGENT).unwrap();
+        let proxy = ModeBackend::new(cell.clone(), "lab", None, live()).unwrap();
+        assert_eq!(
+            names(proxy.list_tools(json!({})).await.unwrap()),
+            vec![
+                "read_document",
+                "write_document",
+                "mystery",
+                AGENT_DECLARE,
+                AGENT_STATUS,
+                AGENT_CLEAR
+            ]
+        );
+        proxy.call_tool(call("mystery", json!({}))).await.unwrap();
+        assert!(proxy
+            .call_tool(call(MODE_SET, json!({"modeIri":READER})))
+            .await
+            .is_err());
+        assert_eq!(cell.forwarded().await, vec!["mystery"]);
+        assert!(proxy
+            .call_tool(call(AGENT_DECLARE, json!({"agentId":"scout"})))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn declare_switch_and_clear_change_discovery_and_calls() {
+        let cell = Arc::new(Cell::new());
+        let proxy = ModeBackend::new(cell.clone(), "lab", None, live()).unwrap();
+        let mut notes = proxy.take_notifications().unwrap();
         assert_eq!(
             proxy.initialize(json!({})).await.unwrap()["capabilities"]["tools"]["listChanged"],
             true
         );
+        let declared = proxy
+            .call_tool(call(AGENT_DECLARE, json!({"agentId":AGENT})))
+            .await
+            .unwrap();
+        assert_eq!(declared["structuredContent"]["activeMode"], READER);
+        assert_eq!(drain(&mut notes), 1);
         assert_eq!(
             names(proxy.list_tools(json!({})).await.unwrap()),
-            vec![MODE_STATUS, MODE_LIST, MODE_SET, "read_document"]
+            with(&["read_document"])
         );
         assert!(proxy
             .call_tool(call("write_document", json!({})))
@@ -712,14 +1063,6 @@ mod tests {
             .is_err());
         assert!(cell.forwarded().await.is_empty());
 
-        let choices = proxy.call_tool(call(MODE_LIST, json!({}))).await.unwrap();
-        assert_eq!(
-            choices["structuredContent"]["modes"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
         assert!(proxy
             .call_tool(call(MODE_SET, json!({"modeIri":"urn:sophia:mode:other"})))
             .await
@@ -729,15 +1072,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(switched["structuredContent"]["changed"], true);
+        assert_eq!(drain(&mut notes), 1);
         assert_eq!(
             names(proxy.list_tools(json!({})).await.unwrap()),
-            vec![
-                MODE_STATUS,
-                MODE_LIST,
-                MODE_SET,
-                "read_document",
-                "write_document",
-            ]
+            with(&["read_document", "write_document"])
         );
         assert!(proxy
             .call_tool(call("write_document", json!({})))
@@ -745,7 +1083,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("approval_required"));
-        assert!(proxy.call_tool(call("mystery", json!({}))).await.is_err());
         assert!(proxy
             .call_tool(call("read_document", json!({"graphId":"elsewhere"})))
             .await
@@ -755,70 +1092,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cell.forwarded().await, vec!["read_document"]);
+
+        proxy.call_tool(call(AGENT_CLEAR, json!({}))).await.unwrap();
+        assert_eq!(drain(&mut notes), 1);
+        assert_eq!(
+            names(proxy.list_tools(json!({})).await.unwrap()).len(),
+            6,
+            "full catalogue again"
+        );
     }
 
     #[tokio::test]
-    async fn revoked_selection_fails_closed_but_can_switch_to_remaining_mode() {
+    async fn revoking_the_active_mode_falls_back_to_the_default_with_a_notice() {
         let cell = Arc::new(Cell::new());
-        let proxy = ModeBackend::new(cell.clone(), "lab", AGENT).unwrap();
-        proxy.call_tool(call(MODE_STATUS, json!({}))).await.unwrap();
-        cell.revoked.store(true, Ordering::SeqCst);
-        assert!(proxy
-            .call_tool(call("read_document", json!({})))
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("revoked"));
-        assert_eq!(
-            names(proxy.list_tools(json!({})).await.unwrap()),
-            vec![MODE_STATUS, MODE_LIST, MODE_SET]
-        );
-        assert_eq!(
-            proxy.call_tool(call(MODE_STATUS, json!({}))).await.unwrap()["structuredContent"]
-                ["current"],
-            false
-        );
+        let proxy = ModeBackend::new(cell.clone(), "lab", Some(AGENT), live()).unwrap();
+        let mut notes = proxy.take_notifications().unwrap();
         proxy
             .call_tool(call(MODE_SET, json!({"modeIri":WRITER})))
             .await
             .unwrap();
-        assert_eq!(
-            proxy.call_tool(call(MODE_STATUS, json!({}))).await.unwrap()["structuredContent"]
-                ["current"],
-            true
+        drain(&mut notes);
+        cell.revoked.store(true, Ordering::SeqCst);
+        let refused = proxy
+            .call_tool(call("read_document", json!({})))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("revoked") && refused.contains(READER),
+            "{refused}"
         );
+        assert_eq!(drain(&mut notes), 1);
+        assert_eq!(
+            names(proxy.list_tools(json!({})).await.unwrap()),
+            with(&["read_document"])
+        );
+        proxy
+            .call_tool(call("read_document", json!({})))
+            .await
+            .unwrap();
+        assert!(proxy
+            .call_tool(call(MODE_SET, json!({"modeIri":WRITER})))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
-    async fn graph_edits_cannot_widen_a_running_processs_mode_choices() {
+    async fn graph_edits_are_live_and_new_modes_selectable_immediately() {
         let cell = Arc::new(Cell::new());
-        let proxy = ModeBackend::new(cell.clone(), "lab", AGENT).unwrap();
+        let proxy = ModeBackend::new(cell.clone(), "lab", Some(AGENT), live()).unwrap();
         proxy.call_tool(call(MODE_STATUS, json!({}))).await.unwrap();
         cell.expanded.store(true, Ordering::SeqCst);
-        assert!(proxy
-            .call_tool(call(MODE_SET, json!({"modeIri":"urn:sophia:mode:admin"})))
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("when this MCP process started"));
         assert_eq!(
             proxy.call_tool(call(MODE_LIST, json!({}))).await.unwrap()["structuredContent"]
                 ["modes"]
                 .as_array()
                 .unwrap()
                 .len(),
-            2
-        );
-        let restarted = ModeBackend::new(cell, "lab", AGENT).unwrap();
-        assert_eq!(
-            restarted
-                .call_tool(call(MODE_LIST, json!({})))
-                .await
-                .unwrap()["structuredContent"]["modes"]
-                .as_array()
-                .unwrap()
-                .len(),
             3
+        );
+        proxy
+            .call_tool(call(MODE_SET, json!({"modeIri":"urn:sophia:mode:admin"})))
+            .await
+            .unwrap();
+        proxy
+            .call_tool(call("write_document", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(cell.forwarded().await, vec!["write_document"]);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_graph_fails_calls_closed_but_keeps_controls() {
+        let cell = Arc::new(Cell::new());
+        let proxy = ModeBackend::new(cell.clone(), "lab", Some(AGENT), live()).unwrap();
+        proxy
+            .call_tool(call("read_document", json!({})))
+            .await
+            .unwrap();
+        cell.unreadable.store(true, Ordering::SeqCst);
+        let refused = proxy
+            .call_tool(call("read_document", json!({})))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("retryable"), "{refused}");
+        let status = proxy.call_tool(call(MODE_STATUS, json!({}))).await.unwrap();
+        assert_eq!(status["structuredContent"]["current"], false);
+        assert_eq!(
+            names(proxy.list_tools(json!({})).await.unwrap()),
+            with(&["read_document"]),
+            "discovery keeps the last good read"
+        );
+        cell.unreadable.store(false, Ordering::SeqCst);
+        proxy
+            .call_tool(call("read_document", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(
+            cell.forwarded().await,
+            vec!["read_document", "read_document"]
         );
     }
 
@@ -826,7 +1199,7 @@ mod tests {
     async fn conflicting_tool_descriptors_fail_before_any_call_is_forwarded() {
         let cell = Arc::new(Cell::new());
         cell.duplicate.store(true, Ordering::SeqCst);
-        let proxy = ModeBackend::new(cell.clone(), "lab", AGENT).unwrap();
+        let proxy = ModeBackend::new(cell.clone(), "lab", Some(AGENT), live()).unwrap();
         assert!(proxy
             .call_tool(call("read_document", json!({})))
             .await
@@ -839,6 +1212,7 @@ mod tests {
     #[test]
     fn parser_rejects_incomplete_or_invented_mode_authority() {
         assert!(!valid_agent_id("scout"));
+        assert!(!valid_agent_id("agent-DEADBEEF"));
         assert!(!valid_mode_iri("urn:sophia:mode:a>"));
         assert!(valid_mode_iri(READER));
         let mut incomplete = rows(false, false);
