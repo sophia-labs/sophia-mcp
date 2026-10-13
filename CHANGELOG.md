@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.6.2 — 2026-10-12
+
+- **Behind Cloudflare Access.** `--cf-access-client-id` /
+  `--cf-access-client-secret` (env `CF_ACCESS_CLIENT_ID` /
+  `CF_ACCESS_CLIENT_SECRET`) send an Access service token as
+  `CF-Access-Client-Id` / `CF-Access-Client-Secret`, so sophia-mcp can reach a
+  self-hosted Sophia behind a Cloudflare Tunnel and Access application directly
+  (`--backend https://sophia.example.com/mcp`). See README *Behind Cloudflare
+  Access*.
+- **Extra request headers.** `--header 'Name: value'` (repeatable) and
+  `SOPHIA_MCP_HEADERS` (one per line, or `;`-separated). Like the Access pair,
+  they go on every request to the remote `--backend` and nowhere else: never a
+  `--sub`, never a redirect (none are followed), and never plain `http://` to a
+  non-loopback host without `--allow-insecure-http`. Values are never logged.
+  Headers sophia-mcp sets itself (`Authorization`, `Origin`,
+  `x-pn-on-behalf-of`, `X-User-ID`), framing headers and duplicate names are
+  refused. Ignored for `--backend local`.
+- **Access refusals are named.** A redirect to Access's login page, a non-JSON
+  401/403 from the Cloudflare edge, or an HTML page where JSON was expected now
+  fails with an error that says Cloudflare Access refused and what to check,
+  instead of a JSON parse error. Sophia's own JSON 401/403 and a proxy's HTML
+  5xx keep their previous handling; a Cloudflare bot challenge is named as such.
+- `--help` no longer prints the values of `SOPHIA_MCP_TOKEN`,
+  `SOPHIA_MCP_SUB_TOKENS` or `CF_ACCESS_CLIENT_SECRET` when they are set.
+
 ## 0.6.1 — 2026-09-23
 
 - **Per-sub acting identity.** `--sub-on-behalf-of <prefix>=<subject>`
