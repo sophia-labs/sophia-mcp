@@ -53,6 +53,9 @@ pub struct ToolNotFound(pub String);
 /// payloads stay as opaque `Value`s — garden owns the schema, sophia-mcp passes it
 /// through.
 #[async_trait]
+// async_trait marks each method `#[must_use]` while its boxed future is already
+// must-use; clippy 1.99 flags that as `double_must_use`.
+#[allow(clippy::double_must_use)]
 pub trait Backend: Send + Sync {
     /// Forward `initialize`. `client_params` is the agent's `initialize` params
     /// (capabilities, clientInfo). The backend returns the server's
