@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use reqwest::header::{HeaderName, HeaderValue};
 
 /// Stdio MCP server that proxies to a Mnemosyne/garden backend.
 ///
@@ -37,8 +38,39 @@ pub struct Cli {
     /// ends up in shell history too. The flag keeps working — for one-off
     /// local testing, or an environment that already isolates argv — but the
     /// env var is the one to reach for by default.
-    #[arg(long, env = "SOPHIA_MCP_TOKEN")]
+    #[arg(long, env = "SOPHIA_MCP_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
+
+    /// Extra HTTP header for a REMOTE backend, as `'Name: value'`. Repeatable.
+    /// Sent on every request to the `--backend` (a direct `/mcp`, or every
+    /// gateway path) and nowhere else: not to `--sub` MCPs, and never across
+    /// a redirect, since sophia-mcp follows none. Env `SOPHIA_MCP_HEADERS`
+    /// adds more, one `Name: value` per line or `;`-separated (use `--header`
+    /// for a value that contains `;`). A name given twice across all sources
+    /// is refused, as are the headers sophia-mcp sets itself (`Authorization`:
+    /// use `SOPHIA_MCP_TOKEN`; `Origin`, `x-pn-on-behalf-of`, `X-User-ID`) and
+    /// HTTP framing headers. Values are never logged. Ignored for
+    /// `--backend local`.
+    #[arg(long = "header", value_name = "NAME: VALUE")]
+    pub headers: Vec<String>,
+
+    /// Cloudflare Access service-token Client ID, sent as
+    /// `CF-Access-Client-Id` to a REMOTE backend behind Cloudflare Access.
+    /// Needs `--cf-access-client-secret` too. The Access application needs a
+    /// policy with action Service Auth that includes this token.
+    #[arg(long, env = "CF_ACCESS_CLIENT_ID", value_name = "ID")]
+    pub cf_access_client_id: Option<String>,
+
+    /// Cloudflare Access service-token Client Secret, sent as
+    /// `CF-Access-Client-Secret`. Prefer the env var: a secret on the command
+    /// line is visible to anyone who can list this machine's processes.
+    #[arg(
+        long,
+        env = "CF_ACCESS_CLIENT_SECRET",
+        value_name = "SECRET",
+        hide_env_values = true
+    )]
+    pub cf_access_client_secret: Option<String>,
 
     /// Service-auth "on behalf of" subject. When set against a gateway, sophia-mcp
     /// sends `x-pn-on-behalf-of: <sub>` and the gateway runs its own per-graph
@@ -168,7 +200,8 @@ pub struct Cli {
     #[arg(
         long = "sub-token",
         env = "SOPHIA_MCP_SUB_TOKENS",
-        value_delimiter = ','
+        value_delimiter = ',',
+        hide_env_values = true
     )]
     pub sub_tokens: Vec<String>,
 
@@ -200,6 +233,33 @@ impl Cli {
     /// Is the LOCAL backend selected?
     pub fn is_local(&self) -> bool {
         self.backend.eq_ignore_ascii_case("local")
+    }
+
+    /// Extra headers for a REMOTE backend, from `SOPHIA_MCP_HEADERS`,
+    /// `--header` and the Cloudflare Access pair, in that order (see
+    /// [`resolve_extra_headers`]).
+    pub fn resolved_extra_headers(&self) -> anyhow::Result<Vec<(HeaderName, HeaderValue)>> {
+        let env = match std::env::var(HEADERS_ENV) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("{HEADERS_ENV} is not valid UTF-8")
+            }
+        };
+        resolve_extra_headers(
+            env.as_deref(),
+            &self.headers,
+            self.cf_access_client_id.as_deref(),
+            self.cf_access_client_secret.as_deref(),
+        )
+    }
+
+    /// Is any extra-header source set? LOCAL ignores them, and says so.
+    pub fn has_extra_header_config(&self) -> bool {
+        !self.headers.is_empty()
+            || self.cf_access_client_id.is_some()
+            || self.cf_access_client_secret.is_some()
+            || std::env::var_os(HEADERS_ENV).is_some()
     }
 
     /// Default local profile dir: `~/.sophia-mcp/profile`.
@@ -252,6 +312,135 @@ impl Cli {
         }
         Ok(specs)
     }
+}
+
+/// Env var carrying extra headers for a REMOTE backend: one `Name: value` per
+/// line, or `;`-separated.
+pub const HEADERS_ENV: &str = "SOPHIA_MCP_HEADERS";
+
+/// Headers sophia-mcp sets from its own flags; an extra header may not
+/// override them. `(name, why)`.
+const OWNED_HEADERS: [(&str, &str); 4] = [
+    (
+        "authorization",
+        "sophia-mcp sends it from SOPHIA_MCP_TOKEN (--token)",
+    ),
+    (
+        "origin",
+        "sophia-mcp sets it only for its own local gardend",
+    ),
+    ("x-pn-on-behalf-of", "use --on-behalf-of"),
+    ("x-user-id", "use --user-id"),
+];
+
+/// Message framing the HTTP client owns.
+const FRAMING_HEADERS: [&str; 10] = [
+    "host",
+    "content-length",
+    "content-type",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "upgrade",
+];
+
+/// Parse one `Name: value`. Errors name the header, never its value: values
+/// are often secrets. The value is marked sensitive, so `Debug` hides it.
+fn parse_header(raw: &str, source: &str) -> anyhow::Result<(HeaderName, HeaderValue)> {
+    let Some((name, value)) = raw.split_once(':') else {
+        anyhow::bail!("{source}: an entry is not 'Name: value' (no ':')");
+    };
+    let name = name.trim();
+    let header = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| anyhow::anyhow!("{source}: '{name}' is not a valid header name"))?;
+    let lower = header.as_str();
+    if let Some((_, why)) = OWNED_HEADERS.iter().find(|(owned, _)| *owned == lower) {
+        anyhow::bail!("{source}: '{name}' cannot be an extra header: {why}");
+    }
+    if FRAMING_HEADERS.contains(&lower) {
+        anyhow::bail!("{source}: '{name}' cannot be an extra header: the HTTP client sets it");
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("{source}: header '{name}' has an empty value");
+    }
+    let mut value = HeaderValue::from_str(value).map_err(|_| {
+        anyhow::anyhow!(
+            "{source}: header '{name}' has a value that is not valid in HTTP (a control character?)"
+        )
+    })?;
+    value.set_sensitive(true);
+    Ok((header, value))
+}
+
+fn push_unique(
+    out: &mut Vec<(HeaderName, HeaderValue)>,
+    (name, value): (HeaderName, HeaderValue),
+) -> anyhow::Result<()> {
+    if out.iter().any(|(seen, _)| *seen == name) {
+        anyhow::bail!(
+            "header '{name}' is given more than once across {HEADERS_ENV}, --header and --cf-access-client-*"
+        );
+    }
+    out.push((name, value));
+    Ok(())
+}
+
+/// Resolve the extra headers for a REMOTE backend, in order: `env` (the
+/// value of `SOPHIA_MCP_HEADERS`: one `Name: value` per line or
+/// `;`-separated, blank entries skipped), then each `--header`, then the
+/// Cloudflare Access service-token pair as `CF-Access-Client-Id` and
+/// `CF-Access-Client-Secret`. The pair goes together: one without the other
+/// is refused (blank counts as absent). Refuses a malformed entry, a header
+/// sophia-mcp sets itself, a framing header, and any name given twice
+/// (names compare case-insensitively). No error ever contains a value.
+pub fn resolve_extra_headers(
+    env: Option<&str>,
+    flags: &[String],
+    cf_access_client_id: Option<&str>,
+    cf_access_client_secret: Option<&str>,
+) -> anyhow::Result<Vec<(HeaderName, HeaderValue)>> {
+    let mut out = Vec::new();
+    for raw in env.unwrap_or("").split(['\n', ';']) {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            push_unique(&mut out, parse_header(raw, HEADERS_ENV)?)?;
+        }
+    }
+    for raw in flags {
+        push_unique(&mut out, parse_header(raw, "--header")?)?;
+    }
+    let id = cf_access_client_id.map(str::trim).filter(|s| !s.is_empty());
+    let secret = cf_access_client_secret
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (id, secret) {
+        (Some(id), Some(secret)) => {
+            push_unique(
+                &mut out,
+                parse_header(
+                    &format!("CF-Access-Client-Id: {id}"),
+                    "--cf-access-client-id",
+                )?,
+            )?;
+            push_unique(
+                &mut out,
+                parse_header(
+                    &format!("CF-Access-Client-Secret: {secret}"),
+                    "--cf-access-client-secret",
+                )?,
+            )?;
+        }
+        (None, None) => {}
+        _ => anyhow::bail!(
+            "--cf-access-client-id and --cf-access-client-secret go together \
+             (env CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET); only one is set"
+        ),
+    }
+    Ok(out)
 }
 
 /// One configured sub-MCP, resolved from `--sub <prefix>=<url>` plus its
@@ -418,5 +607,158 @@ mod tests {
         ])
         .unwrap();
         assert!(wrong_prefix.resolved_subs().is_err());
+    }
+
+    // ------------------------------------------------------ extra headers
+
+    fn names_and_values(headers: &[(HeaderName, HeaderValue)]) -> Vec<(String, String)> {
+        headers
+            .iter()
+            .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap().to_string()))
+            .collect()
+    }
+
+    fn expect(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn env_headers_split_on_newlines_and_semicolons() {
+        let got = resolve_extra_headers(
+            Some("X-One: 1\r\nX-Two:2 ;  X-Three:  three \n\n;"),
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            names_and_values(&got),
+            expect(&[("x-one", "1"), ("x-two", "2"), ("x-three", "three")])
+        );
+    }
+
+    #[test]
+    fn flags_and_the_access_pair_follow_the_env_headers() {
+        let cli = Cli::try_parse_from([
+            "sophia-mcp",
+            "--backend",
+            "https://sophia.example.com/mcp",
+            "--header",
+            "X-Flag: a;b",
+            "--cf-access-client-id",
+            "abc.access",
+            "--cf-access-client-secret",
+            "s3cr3t",
+        ])
+        .unwrap();
+        let got = resolve_extra_headers(
+            Some("X-Env: e"),
+            &cli.headers,
+            cli.cf_access_client_id.as_deref(),
+            cli.cf_access_client_secret.as_deref(),
+        )
+        .unwrap();
+        // A --header value is never split on ';'.
+        assert_eq!(
+            names_and_values(&got),
+            expect(&[
+                ("x-env", "e"),
+                ("x-flag", "a;b"),
+                ("cf-access-client-id", "abc.access"),
+                ("cf-access-client-secret", "s3cr3t"),
+            ])
+        );
+        assert!(got.iter().all(|(_, v)| v.is_sensitive()));
+        assert!(!format!("{got:?}").contains("s3cr3t"));
+    }
+
+    #[test]
+    fn the_access_pair_goes_together() {
+        for (id, secret) in [
+            (Some("abc.access"), None),
+            (None, Some("s3cr3t")),
+            (Some("abc.access"), Some("  ")),
+        ] {
+            let msg = format!(
+                "{}",
+                resolve_extra_headers(None, &[], id, secret).unwrap_err()
+            );
+            assert!(
+                msg.contains("--cf-access-client-id") && msg.contains("--cf-access-client-secret"),
+                "{msg}"
+            );
+            assert!(!msg.contains("s3cr3t"), "{msg}");
+        }
+        assert!(resolve_extra_headers(None, &[], None, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn headers_sophia_mcp_owns_or_the_client_frames_are_refused() {
+        for (raw, why) in [
+            ("Authorization: Bearer s3cr3t", "SOPHIA_MCP_TOKEN"),
+            ("X-PN-On-Behalf-Of: s3cr3t", "--on-behalf-of"),
+            ("x-user-id: s3cr3t", "--user-id"),
+            ("Origin: s3cr3t", "local gardend"),
+            ("Host: s3cr3t", "HTTP client"),
+            ("Content-Length: s3cr3t", "HTTP client"),
+        ] {
+            let msg = format!(
+                "{}",
+                resolve_extra_headers(None, &[raw.to_string()], None, None).unwrap_err()
+            );
+            assert!(
+                msg.contains("cannot be an extra header") && msg.contains(why),
+                "{raw}: {msg}"
+            );
+            assert!(!msg.contains("s3cr3t"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_name_given_twice_is_refused_across_sources_and_case() {
+        let msg = format!(
+            "{}",
+            resolve_extra_headers(
+                Some("cf-access-client-id: one"),
+                &[],
+                Some("two.access"),
+                Some("s3cr3t"),
+            )
+            .unwrap_err()
+        );
+        assert!(
+            msg.contains("cf-access-client-id") && msg.contains("more than once"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("s3cr3t") && !msg.contains("two.access"),
+            "{msg}"
+        );
+        assert!(
+            resolve_extra_headers(None, &["X-A: 1".into(), "x-a: 2".into()], None, None).is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_entries_are_refused_without_echoing_a_value() {
+        for raw in [
+            "s3cr3t-without-a-colon",
+            ": s3cr3t",
+            "X-Empty:   ",
+            "Bad Name: s3cr3t",
+            "X-Ctl: s3cr3t\u{1}x",
+        ] {
+            let msg = format!(
+                "{}",
+                resolve_extra_headers(None, &[raw.to_string()], None, None).unwrap_err()
+            );
+            assert!(msg.starts_with("--header: "), "{raw}: {msg}");
+            assert!(!msg.contains("s3cr3t"), "{raw}: {msg}");
+        }
     }
 }

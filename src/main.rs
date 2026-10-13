@@ -125,6 +125,11 @@ async fn serve_until_shutdown(backend: Arc<dyn Backend>) -> anyhow::Result<()> {
 
 async fn build_backend(cli: &Cli) -> anyhow::Result<Arc<dyn Backend>> {
     if cli.is_local() {
+        if cli.has_extra_header_config() {
+            tracing::warn!(
+                "--header, SOPHIA_MCP_HEADERS and --cf-access-client-* apply only to a remote --backend; ignored for local"
+            );
+        }
         let opts = backend::local::LocalGardenOptions {
             profile_dir: cli.resolved_profile_dir(),
             garden_bin: cli.garden_bin.clone(),
@@ -143,12 +148,21 @@ async fn build_backend(cli: &Cli) -> anyhow::Result<Arc<dyn Backend>> {
     }
 
     // REMOTE backend: a URL to an existing backend's MCP endpoint.
+    let extra = cli
+        .resolved_extra_headers()
+        .context("reading --header / SOPHIA_MCP_HEADERS / --cf-access-client-*")?;
+    if !extra.is_empty() {
+        let names: Vec<&str> = extra.iter().map(|(name, _)| name.as_str()).collect();
+        tracing::info!(headers = ?names, "sending extra headers to the backend only (values not logged)");
+    }
     let auth = AuthHeaders {
         bearer: cli.token.clone(),
         on_behalf_of: cli.on_behalf_of.clone(),
         user_id: cli.user_id.clone(),
         // Remote endpoints (gateway / hosted) don't enforce a loopback Origin.
         origin: None,
+        // Only this backend's client carries them: sub-MCPs build their own.
+        extra,
     };
     if let (Some(owner), Some(graph)) = (cli.owner.as_deref(), cli.graph.as_deref()) {
         let opts = GatewayOptions {

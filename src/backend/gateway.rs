@@ -45,8 +45,8 @@ use serde_json::{json, Value};
 use crate::mcp::{self, method};
 
 use super::remote::{
-    build_client, post_rpc, read_bounded_text, redact_body, rpc_result, urlencode_segment,
-    HttpReply, MAX_RESPONSE_BYTES,
+    build_client, check_not_access_refusal, post_rpc, read_bounded_text, redact_body, rpc_result,
+    urlencode_segment, HttpReply, MAX_RESPONSE_BYTES,
 };
 use super::{AuthHeaders, Backend, ToolNotFound};
 
@@ -823,9 +823,11 @@ impl GatewayBackend {
             .await
             .with_context(|| format!("POST {}", session.activate_url))?;
         let status = http.status();
+        let headers = http.headers().clone();
         let body = read_bounded_text(http, &session.activate_url, MAX_RESPONSE_BYTES)
             .await
             .context("read activate response body")?;
+        check_not_access_refusal(status, &headers, &body, &session.activate_url)?;
         Ok(HttpReply { status, body })
     }
 
@@ -837,10 +839,11 @@ impl GatewayBackend {
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = http.status();
+        let headers = http.headers().clone();
         // Redirects are never followed (see `build_client`); name the target
         // so the refusal is legible, then let the 3xx surface as a rejection.
         let location = status.is_redirection().then(|| {
-            http.headers()
+            headers
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("<no Location header>")
@@ -849,6 +852,7 @@ impl GatewayBackend {
         let mut body = read_bounded_text(http, url, MAX_RESPONSE_BYTES)
             .await
             .context("read activation poll body")?;
+        check_not_access_refusal(status, &headers, &body, url)?;
         if let Some(location) = location {
             body = format!(
                 "redirect to '{location}' not followed; {}",

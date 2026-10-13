@@ -174,6 +174,60 @@ When `--on-behalf-of` is set, sophia-mcp does **not** also send `X-User-ID` — 
 is the on-behalf-of header (the gateway runs its own per-graph ACL for that
 subject).
 
+### Behind Cloudflare Access
+
+If your Sophia (a self-hosted `gardend`) is reached through a Cloudflare Tunnel
+with a Cloudflare Access application in front, sophia-mcp passes Access with a
+**service token**. In Cloudflare Zero Trust, create one under *Access controls →
+Service credentials → Service Tokens* (the secret is shown once), and add it to
+a policy on the application whose action is **Service Auth**. Then give
+sophia-mcp the token's Client ID and Secret alongside your Sophia key. Access
+and Sophia each check their own credential.
+
+```bash
+SOPHIA_MCP_TOKEN="<your Sophia key>" \
+CF_ACCESS_CLIENT_ID="<client id>.access" \
+CF_ACCESS_CLIENT_SECRET="<client secret>" \
+sophia-mcp --backend https://sophia.example.com/mcp
+```
+
+The same in an MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "sophia": {
+      "command": "sophia-mcp",
+      "args": ["--backend", "https://sophia.example.com/mcp"],
+      "env": {
+        "SOPHIA_MCP_TOKEN": "<your Sophia key>",
+        "CF_ACCESS_CLIENT_ID": "<client id>.access",
+        "CF_ACCESS_CLIENT_SECRET": "<client secret>"
+      }
+    }
+  }
+}
+```
+
+* sophia-mcp sends `CF-Access-Client-Id` and `CF-Access-Client-Secret` on
+  **every** request to the `--backend` (Access issues no cookie to a service
+  token) and nowhere else: not to `--sub` MCPs, and never across a redirect,
+  because sophia-mcp follows none. Over plain `http://` to a non-loopback host
+  it refuses to send them, as it does a bearer.
+* If Access turns a request away (a redirect to its login page, a 401/403 from
+  Cloudflare, or an HTML login page where JSON was expected), the error says
+  that Cloudflare Access refused and what to check, instead of a JSON parse
+  failure. Sophia's own refusals (a wrong key) keep their own message.
+* `--cf-access-client-id` / `--cf-access-client-secret` work too, but prefer the
+  env vars: a secret on the command line is visible to anyone who can list
+  this machine's processes.
+* For any other header a proxy in front of your backend needs, use
+  `--header 'Name: value'` (repeatable) or `SOPHIA_MCP_HEADERS` (one
+  `Name: value` per line, or `;`-separated). The same rules apply: backend
+  only, values never logged. sophia-mcp refuses a header it sets itself
+  (`Authorization` comes from `SOPHIA_MCP_TOKEN`), a framing header, and a name
+  given twice.
+
 ### Multi-graph: control tools + `graph_id` routing
 
 Against a gateway, the agent sees **one** tool catalog that is the union of two
@@ -386,6 +440,9 @@ Every flag has an env var twin.
 |---|---|---|---|
 | `--backend` | `SOPHIA_MCP_BACKEND` | `local` | `local`, or a backend URL |
 | `--token` | `SOPHIA_MCP_TOKEN` | — | bearer token for REMOTE. **Prefer the env var** — a token on the command line is visible to anyone who can list this machine's processes for as long as sophia-mcp runs |
+| `--header` | `SOPHIA_MCP_HEADERS` | — | extra header for a REMOTE backend, `'Name: value'` (repeatable; env is one per line or `;`-separated); sent to the backend only, values never logged |
+| `--cf-access-client-id` | `CF_ACCESS_CLIENT_ID` | — | Cloudflare Access service-token Client ID, sent as `CF-Access-Client-Id` (see *Behind Cloudflare Access*) |
+| `--cf-access-client-secret` | `CF_ACCESS_CLIENT_SECRET` | — | its Client Secret, sent as `CF-Access-Client-Secret`. **Prefer the env var** |
 | `--on-behalf-of` | `SOPHIA_MCP_ON_BEHALF_OF` | — | gateway service-auth subject |
 | `--user-id` | `SOPHIA_MCP_USER_ID` | — | `X-User-ID` side-channel |
 | `--owner` | `SOPHIA_MCP_OWNER` | — | stable typed owner required for cloud-2 |
@@ -504,6 +561,8 @@ tests/
   remote_proxy.rs      end-to-end RemoteHttp against a mock /mcp
   gateway_multigraph.rs  end-to-end GatewayBackend against a mock gateway
   composed_subs.rs     end-to-end ComposedBackend against mock primary + sub servers
+  extra_headers.rs     --header / SOPHIA_MCP_HEADERS / Cloudflare Access headers and
+                       refusals against real HTTP listeners on 127.0.0.1
 ```
 
 ---
@@ -514,7 +573,7 @@ tests/
 cargo test
 ```
 
-101 tests: URL resolution, auth-header construction, catalog merging (prefixing,
+149 tests: URL resolution, auth-header construction, catalog merging (prefixing,
 pagination), graph-argument parsing/normalization, sub-MCP prefix parsing/validation,
 `gardend` discovery resolution order (explicit `--garden-bin` wins and errors if
 missing, exe-adjacent, sibling-checkout `examples/` release then debug, `PATH`
@@ -537,8 +596,13 @@ pollUrl, transient 503 at kick, health-200-is-not-readiness) and mid-session
 re-activation, and a wiremock `ComposedBackend` covering the merged catalog
 (descriptions verbatim), `<prefix>_<name>` routing through the real stdio dispatch,
 a non-prefixed call still reaching the primary, a sub whose `tools/list` 500s at
-start being skipped (`layout_x` → `-32601`, no network touched), and per-sub
-bearer tokens never crossing to the primary or another sub.
+start being skipped (`layout_x` → `-32601`, no network touched), per-sub
+bearer tokens never crossing to the primary or another sub, and extra headers
+(`--header`, `SOPHIA_MCP_HEADERS`, the Cloudflare Access pair): their parsing
+and refusals, their arrival on every request at a real local listener (direct
+and gateway) and never at a sub, a redirect target or stderr, and Access
+refusals (login redirect, edge 403, HTML login page) named as such while
+gardend's own JSON 401 keeps its message.
 
 ---
 

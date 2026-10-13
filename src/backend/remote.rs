@@ -33,6 +33,12 @@ use super::Backend;
 ///     `x-pn-on-behalf-of: <sub>`.
 ///   * REMOTE direct user: `Authorization: Bearer <jwt>` (+ optional
 ///     `X-User-ID`).
+///
+/// Plus any `extra` headers for a REMOTE backend (`--header`,
+/// `SOPHIA_MCP_HEADERS`, the Cloudflare Access service-token pair; parsed by
+/// `config::resolve_extra_headers`). They ride the client built for that one
+/// backend, so they reach only its URLs, and never a redirect target, since
+/// sophia-mcp follows no redirects.
 #[derive(Debug, Clone, Default)]
 pub struct AuthHeaders {
     pub bearer: Option<String>,
@@ -40,9 +46,19 @@ pub struct AuthHeaders {
     pub user_id: Option<String>,
     /// Origin header value (set for the local loopback to satisfy `origin_ok`).
     pub origin: Option<String>,
+    /// Extra headers sent as given. Values are expected to be marked
+    /// sensitive (`HeaderValue::set_sensitive`), so `Debug` never prints
+    /// them. A name that collides with a header set above is refused.
+    pub extra: Vec<(HeaderName, HeaderValue)>,
 }
 
 impl AuthHeaders {
+    /// True when this would send a credential: a bearer, or any extra header
+    /// (an Access service-token secret is as much a credential as a bearer).
+    fn carries_credentials(&self) -> bool {
+        self.bearer.is_some() || !self.extra.is_empty()
+    }
+
     fn into_header_map(self) -> anyhow::Result<HeaderMap> {
         let mut map = HeaderMap::new();
         if let Some(bearer) = self.bearer {
@@ -71,6 +87,14 @@ impl AuthHeaders {
                 name,
                 HeaderValue::from_str(&uid).context("invalid X-User-ID value")?,
             );
+        }
+        for (name, value) in self.extra {
+            if map.contains_key(&name) {
+                return Err(anyhow!(
+                    "extra header '{name}' collides with a header sophia-mcp already sends"
+                ));
+            }
+            map.insert(name, value);
         }
         Ok(map)
     }
@@ -105,22 +129,29 @@ fn is_insecure_plaintext(url: &str) -> bool {
 
 /// Build a reqwest client that carries `auth` on every request to `target_url`.
 ///
-/// Refuses to build a client that would send a bearer token over plain
-/// `http://` to a non-loopback host, unless `allow_insecure_http` is set —
-/// that combination ships a real credential in the clear to whatever's on
-/// the network path. Loopback (127.0.0.0/8, `::1`, `localhost`) is always
-/// allowed regardless of the flag: it's the LOCAL backend's whole mechanism
-/// (a self-minted token to sophia-mcp's own spawned `gardend`), and traffic
-/// that never leaves the machine isn't the threat this guards against.
+/// Refuses to build a client that would send a bearer token (or extra
+/// headers, which may be credentials such as an Access service-token secret)
+/// over plain `http://` to a non-loopback host, unless `allow_insecure_http`
+/// is set — that combination ships a real credential in the clear to
+/// whatever's on the network path. Loopback (127.0.0.0/8, `::1`,
+/// `localhost`) is always allowed regardless of the flag: it's the LOCAL
+/// backend's whole mechanism (a self-minted token to sophia-mcp's own
+/// spawned `gardend`), and traffic that never leaves the machine isn't the
+/// threat this guards against.
 pub(crate) fn build_client(
     auth: AuthHeaders,
     target_url: &str,
     request_timeout: Duration,
     allow_insecure_http: bool,
 ) -> anyhow::Result<reqwest::Client> {
-    if auth.bearer.is_some() && !allow_insecure_http && is_insecure_plaintext(target_url) {
+    if auth.carries_credentials() && !allow_insecure_http && is_insecure_plaintext(target_url) {
+        let what = if auth.bearer.is_some() {
+            "a bearer token"
+        } else {
+            "extra request headers"
+        };
         return Err(anyhow!(
-            "refusing to send a bearer token over plain http:// to a non-loopback host ({target_url}); \
+            "refusing to send {what} over plain http:// to a non-loopback host ({target_url}); \
              pass --allow-insecure-http (or SOPHIA_MCP_ALLOW_INSECURE_HTTP=1) to override, or use https://"
         ));
     }
@@ -212,6 +243,154 @@ pub(crate) fn redact_body(body: &str) -> String {
     )
 }
 
+/// What to do when Cloudflare Access, not Sophia, answered.
+const ACCESS_HINT: &str = "sophia-mcp cannot complete Access's browser login; it needs an Access \
+service token. Create one, add it to a policy with action Service Auth on this Access application, \
+and pass it with --cf-access-client-id / --cf-access-client-secret (env CF_ACCESS_CLIENT_ID / \
+CF_ACCESS_CLIENT_SECRET); sophia-mcp sends them to its --backend only. If you already do, check \
+that the token is current and that the policy action is Service Auth, not Allow.";
+
+/// What to do when Cloudflare's bot protection, not Access, answered.
+const CHALLENGE_HINT: &str =
+    "sophia-mcp cannot solve a challenge. Turn off Bot Fight Mode, or the \
+WAF rule that challenges, for this hostname; admit agents with Cloudflare Access and a service \
+token instead.";
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
+/// Did Cloudflare's edge produce or relay this response? Every response that
+/// comes through a tunnel carries these markers, so this alone never means
+/// Access refused: gardend's own refusals travel the same way.
+fn via_cloudflare(headers: &HeaderMap) -> bool {
+    headers.contains_key("cf-ray")
+        || header_str(headers, "server").eq_ignore_ascii_case("cloudflare")
+}
+
+/// Text that points at Cloudflare Access: its login host, its edge path, or
+/// its name.
+fn mentions_access(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("cloudflareaccess.com")
+        || lower.contains("/cdn-cgi/access/")
+        || lower.contains("cloudflare access")
+}
+
+fn looks_like_html(headers: &HeaderMap, body: &str) -> bool {
+    if header_str(headers, "content-type")
+        .to_ascii_lowercase()
+        .starts_with("text/html")
+    {
+        return true;
+    }
+    let head: String = body.trim_start().chars().take(16).collect();
+    let head = head.to_ascii_lowercase();
+    head.starts_with("<!doctype html") || head.starts_with("<html")
+}
+
+/// `scheme://host` of an absolute URL, or the path of a relative one, with
+/// the query dropped: a login redirect's query carries opaque state that has
+/// no place in an error message.
+fn url_without_query(url: &str) -> &str {
+    let end = match url.find("://") {
+        Some(i) => url[i + 3..]
+            .find(['/', '?', '#'])
+            .map_or(url.len(), |j| i + 3 + j),
+        None => url.find(['?', '#']).unwrap_or(url.len()),
+    };
+    &url[..end]
+}
+
+/// Classify a reply that came from Cloudflare (Access, or its bot challenge)
+/// rather than from Sophia, which answers JSON on every path sophia-mcp
+/// calls. Returns what happened and what to do, or `None` when the reply is
+/// the backend's own. Deliberately narrow:
+///   * a redirect counts only when it points at Access's login;
+///   * a 401/403 counts only with an Access `WWW-Authenticate`, or when it
+///     came through Cloudflare with a body that is not JSON (gardend's and the
+///     gateway's own refusals are JSON, and must keep their own message);
+///   * an HTML page counts only on a 2xx or 401/403, never on a 5xx, so a
+///     proxy's HTML 502 during a restart stays a retryable outage.
+fn access_refusal(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+) -> Option<(String, &'static str)> {
+    if status.is_redirection() {
+        let location = header_str(headers, "location");
+        return mentions_access(location).then(|| {
+            (
+                format!(
+                    "Cloudflare Access redirected the request to its login page at {} (HTTP {status})",
+                    url_without_query(location)
+                ),
+                ACCESS_HINT,
+            )
+        });
+    }
+    if header_str(headers, "cf-mitigated").eq_ignore_ascii_case("challenge") {
+        return Some((
+            format!(
+                "Cloudflare answered with a bot challenge (HTTP {status}, cf-mitigated: challenge) \
+                 instead of passing the request to Sophia; this is not Cloudflare Access"
+            ),
+            CHALLENGE_HINT,
+        ));
+    }
+    let refused = matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN);
+    let html = looks_like_html(headers, body);
+    if refused
+        && (mentions_access(header_str(headers, "www-authenticate"))
+            || (via_cloudflare(headers) && serde_json::from_str::<Value>(body).is_err())
+            || (html && mentions_access(body)))
+    {
+        return Some((
+            format!(
+                "Cloudflare Access refused the request (HTTP {status}) before it reached Sophia"
+            ),
+            ACCESS_HINT,
+        ));
+    }
+    if (status.is_success() || refused) && html {
+        if mentions_access(body) {
+            return Some((
+                format!(
+                    "Cloudflare Access answered with its login page (HTTP {status}, HTML) instead of Sophia's JSON"
+                ),
+                ACCESS_HINT,
+            ));
+        }
+        return Some((
+            format!(
+                "the backend answered with an HTML page (HTTP {status}) where JSON was expected, \
+                 usually a login page from a proxy in front of Sophia such as Cloudflare Access, \
+                 or a URL that is not Sophia's /mcp endpoint"
+            ),
+            ACCESS_HINT,
+        ));
+    }
+    None
+}
+
+/// Fail with a clear, named error when Cloudflare (Access) answered `url`
+/// instead of the backend. Never echoes request headers, so no credential
+/// can reach the message.
+pub(crate) fn check_not_access_refusal(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+    url: &str,
+) -> anyhow::Result<()> {
+    match access_refusal(status, headers, body) {
+        Some((what, hint)) => Err(anyhow!("{url}: {what}. {hint}")),
+        None => Ok(()),
+    }
+}
+
 /// A raw HTTP reply: status + body text. Callers classify it (the gateway
 /// answers 202/502/503 with JSON bodies that are NOT JSON-RPC envelopes).
 #[derive(Debug, Clone)]
@@ -247,7 +426,9 @@ pub(crate) async fn post_rpc(
         .await
         .with_context(|| format!("POST {url} ({method})"))?;
     let status = http.status();
+    let headers = http.headers().clone();
     let body = read_bounded_text(http, url, MAX_RESPONSE_BYTES).await?;
+    check_not_access_refusal(status, &headers, &body, url)?;
     Ok(HttpReply { status, body })
 }
 
@@ -407,6 +588,7 @@ mod tests {
             on_behalf_of: Some("user-sub-123".into()),
             user_id: Some("should-be-dropped".into()),
             origin: None,
+            extra: vec![],
         }
         .into_header_map()
         .unwrap();
@@ -422,6 +604,7 @@ mod tests {
             on_behalf_of: None,
             user_id: Some("u-1".into()),
             origin: Some("http://127.0.0.1".into()),
+            extra: vec![],
         }
         .into_header_map()
         .unwrap();
@@ -605,5 +788,257 @@ mod tests {
         let err = read_bounded_text(resp, "test", 100).await.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("exceeded 100 bytes"), "got: {msg}");
+    }
+
+    // ------------------------------------------------------ extra headers
+
+    fn secret_header(name: &'static str, value: &str) -> (HeaderName, HeaderValue) {
+        let mut value = HeaderValue::from_str(value).unwrap();
+        value.set_sensitive(true);
+        (HeaderName::from_static(name), value)
+    }
+
+    #[test]
+    fn extra_headers_join_the_built_in_ones() {
+        let map = AuthHeaders {
+            bearer: Some("k".into()),
+            extra: vec![
+                secret_header("cf-access-client-id", "id.access"),
+                secret_header("cf-access-client-secret", "s3cr3t"),
+            ],
+            ..Default::default()
+        }
+        .into_header_map()
+        .unwrap();
+        assert_eq!(map.get(AUTHORIZATION).unwrap(), "Bearer k");
+        assert_eq!(map.get("cf-access-client-id").unwrap(), "id.access");
+        assert_eq!(map.get("cf-access-client-secret").unwrap(), "s3cr3t");
+    }
+
+    #[test]
+    fn an_extra_header_may_not_replace_one_sophia_mcp_sends() {
+        let err = AuthHeaders {
+            bearer: Some("k".into()),
+            extra: vec![secret_header("authorization", "Bearer other")],
+            ..Default::default()
+        }
+        .into_header_map()
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("authorization"), "{msg}");
+        assert!(!msg.contains("other"), "the value must not leak: {msg}");
+    }
+
+    #[test]
+    fn debug_never_prints_an_extra_header_value() {
+        let auth = AuthHeaders {
+            extra: vec![secret_header("cf-access-client-secret", "s3cr3t")],
+            ..Default::default()
+        };
+        let debug = format!("{auth:?}");
+        assert!(debug.contains("cf-access-client-secret"), "{debug}");
+        assert!(!debug.contains("s3cr3t"), "{debug}");
+    }
+
+    #[test]
+    fn build_client_refuses_extra_headers_over_plain_http_to_a_non_loopback_host() {
+        let auth = AuthHeaders {
+            extra: vec![secret_header("cf-access-client-secret", "s3cr3t")],
+            ..Default::default()
+        };
+        let err = build_client(
+            auth,
+            "http://sophia.example.com/mcp",
+            Duration::from_secs(30),
+            false,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("extra request headers") && msg.contains("--allow-insecure-http"),
+            "{msg}"
+        );
+        assert!(!msg.contains("s3cr3t"), "{msg}");
+    }
+
+    // ------------------------------------------- Cloudflare Access refusals
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for &(name, value) in pairs {
+            map.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    /// What Cloudflare's edge puts on an HTML page it serves itself.
+    const CF_HTML: [(&str, &str); 3] = [
+        ("cf-ray", "8c1f2a3b4d5e6f70-SJC"),
+        ("server", "cloudflare"),
+        ("content-type", "text/html; charset=UTF-8"),
+    ];
+
+    /// A gardend JSON refusal relayed through a tunnel: same edge markers.
+    const CF_JSON: [(&str, &str); 3] = [
+        ("cf-ray", "8c1f2a3b4d5e6f70-SJC"),
+        ("server", "cloudflare"),
+        ("content-type", "application/json"),
+    ];
+
+    #[test]
+    fn a_redirect_to_the_access_login_is_named_and_its_query_dropped() {
+        let (what, hint) = access_refusal(
+            StatusCode::FOUND,
+            &headers(&[(
+                "location",
+                "https://myteam.cloudflareaccess.com/cdn-cgi/access/login/sophia.example.com?kid=abc&meta=opaque",
+            )]),
+            "",
+        )
+        .unwrap();
+        assert!(
+            what.contains("Cloudflare Access redirected")
+                && what.contains("at https://myteam.cloudflareaccess.com (")
+                && what.contains("302"),
+            "{what}"
+        );
+        assert!(!what.contains("opaque"), "{what}");
+        assert!(
+            hint.contains("--cf-access-client-id") && hint.contains("CF_ACCESS_CLIENT_SECRET"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn a_redirect_elsewhere_is_not_blamed_on_access() {
+        let location = headers(&[("location", "https://elsewhere.example/next")]);
+        assert!(access_refusal(StatusCode::FOUND, &location, "").is_none());
+    }
+
+    #[test]
+    fn an_html_or_empty_401_403_from_cloudflare_is_access() {
+        for (status, body) in [
+            (
+                StatusCode::FORBIDDEN,
+                "<!DOCTYPE html><html><title>Forbidden</title></html>",
+            ),
+            (StatusCode::UNAUTHORIZED, ""),
+        ] {
+            let (what, hint) = access_refusal(status, &headers(&CF_HTML), body).unwrap();
+            assert!(what.contains("Cloudflare Access refused"), "{what}");
+            assert!(what.contains(status.as_str()), "{what}");
+            assert!(hint.contains("Service Auth"), "{hint}");
+        }
+    }
+
+    #[test]
+    fn an_access_www_authenticate_is_access_even_without_edge_markers() {
+        let www = headers(&[(
+            "www-authenticate",
+            "Bearer resource_metadata=\"https://myteam.cloudflareaccess.com/.well-known/oauth-protected-resource\"",
+        )]);
+        let (what, _) = access_refusal(StatusCode::UNAUTHORIZED, &www, "").unwrap();
+        assert!(what.contains("Cloudflare Access refused"), "{what}");
+    }
+
+    #[test]
+    fn a_json_401_403_through_cloudflare_stays_the_backends_own() {
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            assert!(access_refusal(
+                status,
+                &headers(&CF_JSON),
+                r#"{"ok":false,"error":"missing or invalid bearer token"}"#,
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn an_html_login_page_where_json_was_expected_names_access() {
+        let page = "<html><head><title>Sign in - Cloudflare Access</title></head></html>";
+        let (what, _) = access_refusal(StatusCode::OK, &headers(&CF_HTML), page).unwrap();
+        assert!(
+            what.contains("Cloudflare Access answered with its login page"),
+            "{what}"
+        );
+        // Sniffed from the body when there is no content-type at all.
+        let (what, _) =
+            access_refusal(StatusCode::OK, &HeaderMap::new(), &format!("  {page}")).unwrap();
+        assert!(what.contains("login page"), "{what}");
+    }
+
+    #[test]
+    fn an_unmarked_html_page_still_names_access_as_the_usual_cause() {
+        let (what, hint) = access_refusal(
+            StatusCode::OK,
+            &headers(&[("content-type", "text/html")]),
+            "<!doctype html><html><body>app shell</body></html>",
+        )
+        .unwrap();
+        assert!(
+            what.contains("HTML page") && what.contains("Cloudflare Access"),
+            "{what}"
+        );
+        assert!(what.contains("/mcp endpoint"), "{what}");
+        assert!(hint.contains("--cf-access-client-id"), "{hint}");
+    }
+
+    #[test]
+    fn an_html_5xx_stays_a_retryable_outage() {
+        for status in [StatusCode::BAD_GATEWAY, StatusCode::SERVICE_UNAVAILABLE] {
+            assert!(access_refusal(status, &headers(&CF_HTML), "<html>502</html>").is_none());
+        }
+    }
+
+    #[test]
+    fn a_bot_challenge_is_named_and_not_blamed_on_access() {
+        let mut challenge = headers(&CF_HTML);
+        challenge.insert("cf-mitigated", HeaderValue::from_static("challenge"));
+        let (what, hint) = access_refusal(
+            StatusCode::FORBIDDEN,
+            &challenge,
+            "<!DOCTYPE html><title>Just a moment...</title>",
+        )
+        .unwrap();
+        assert!(what.contains("bot challenge"), "{what}");
+        assert!(!what.contains("Access refused"), "{what}");
+        assert!(hint.contains("Bot Fight Mode"), "{hint}");
+    }
+
+    #[test]
+    fn ordinary_json_is_never_an_access_refusal() {
+        let json = headers(&[("content-type", "application/json")]);
+        assert!(access_refusal(StatusCode::OK, &json, r#"{"jsonrpc":"2.0"}"#).is_none());
+    }
+
+    #[test]
+    fn the_refusal_error_names_the_url() {
+        let err = check_not_access_refusal(
+            StatusCode::FORBIDDEN,
+            &headers(&CF_HTML),
+            "<html>Forbidden</html>",
+            "https://sophia.example.com/mcp",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.starts_with("https://sophia.example.com/mcp: Cloudflare Access refused"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn url_without_query_keeps_scheme_and_host_or_a_relative_path() {
+        assert_eq!(
+            url_without_query("https://t.cloudflareaccess.com/cdn-cgi/x?y=1"),
+            "https://t.cloudflareaccess.com"
+        );
+        assert_eq!(
+            url_without_query("/cdn-cgi/access/login/h?meta=1"),
+            "/cdn-cgi/access/login/h"
+        );
     }
 }
